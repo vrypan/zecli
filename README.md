@@ -47,6 +47,11 @@ const spec = cli.CommandSpec{
 };
 
 pub fn run(allocator: std.mem.Allocator, stderr: anytype, args: []const [:0]const u8) !void {
+    if (cli.helpRequested(args)) {
+        // Print help with cli.printCommandHelp(...) and exit 0.
+        return;
+    }
+
     const parsed = try cli.parseCommand(allocator, stderr, args, spec);
 
     const name = parsed.last("name") orelse "world";

@@ -110,6 +110,13 @@ pub fn parse(allocator: Allocator, args: []const [:0]const u8, specs: []const Fl
     return parseInternal(allocator, args, specs, null);
 }
 
+pub fn helpRequested(args: []const [:0]const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
+}
+
 fn parseInternal(allocator: Allocator, args: []const [:0]const u8, specs: []const FlagSpec, diagnostic: ?*ParseDiagnostic) !Parsed {
     var parsed = Parsed{};
     var i: usize = 0;

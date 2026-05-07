@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, args: []const [:0]const u8) !u8 {
-    if (args.len <= 1 or isHelp(args[1])) {
+    if (args.len <= 1 or cli.helpRequested(args[1..2])) {
         try printRootHelp(allocator, stdout);
         return 0;
     }
@@ -99,14 +99,14 @@ fn run(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype, args: []c
 
     const command = args[1];
     if (std.mem.eql(u8, command, "greet")) {
-        if (args.len > 2 and isHelp(args[2])) {
+        if (cli.helpRequested(args[2..])) {
             try cli.printCommandHelp(allocator, stdout, greet_spec);
             return 0;
         }
         return try runGreet(allocator, stdout, stderr, args[2..]);
     }
     if (std.mem.eql(u8, command, "completion")) {
-        if (args.len > 2 and isHelp(args[2])) {
+        if (cli.helpRequested(args[2..])) {
             try cli.printCommandHelp(allocator, stdout, completion_spec);
             return 0;
         }
@@ -159,10 +159,6 @@ fn printRootHelp(allocator: std.mem.Allocator, writer: anytype) !void {
     try writer.print("{s}\n\nUsage: {s}\n", .{ root_spec.description, root_spec.usage });
     try cli.printCommandList(writer, &commands);
     try cli.printOptions(allocator, writer, root_spec.flags, true);
-}
-
-fn isHelp(value: []const u8) bool {
-    return std.mem.eql(u8, value, "--help") or std.mem.eql(u8, value, "-h");
 }
 
 fn writeUpper(writer: anytype, value: []const u8) !void {

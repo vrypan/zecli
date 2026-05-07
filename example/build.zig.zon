@@ -1,0 +1,16 @@
+.{
+    .fingerprint = 0xb285c18bc7c21a5d,
+    .name = .zecli_example,
+    .version = "0.1.0",
+    .dependencies = .{
+        .zecli = .{
+            .path = "..",
+        },
+    },
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

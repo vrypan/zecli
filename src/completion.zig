@@ -9,12 +9,14 @@ pub const CompletionSpec = struct {
     help_flag: cli.FlagSpec = .{ .name = "help", .short = 'h', .description = "Print help" },
 };
 
-fn takesValue(spec: cli.FlagSpec) bool {
-    return spec.value != .none;
+fn takesValue(flag: cli.FlagSpec) bool {
+    return flag.value != .none;
 }
 
 fn hasFileArg(arguments: []const cli.ArgumentSpec) bool {
-    for (arguments) |arg| if (std.mem.eql(u8, arg.name, "FILE")) return true;
+    for (arguments) |arg| {
+        if (std.mem.eql(u8, arg.name, "FILE")) return true;
+    }
     return false;
 }
 
@@ -35,10 +37,11 @@ pub fn generateBash(writer: anytype, spec: CompletionSpec) !void {
         \\        case "${COMP_WORDS[i]}" in
         \\
     );
+
     try writer.writeAll("            ");
-    for (spec.commands, 0..) |c, i| {
+    for (spec.commands, 0..) |cmd, i| {
         if (i > 0) try writer.writeByte('|');
-        try writer.writeAll(c.name);
+        try writer.writeAll(cmd.name);
     }
     try writer.writeAll(
         \\)
@@ -52,15 +55,19 @@ pub fn generateBash(writer: anytype, spec: CompletionSpec) !void {
         \\        if [[ "$cur" == -* ]]; then
         \\
     );
+
     try writer.writeAll("            COMPREPLY=($(compgen -W \"");
     try writeBashFlagWords(writer, spec.root.flags);
     try writeBashFlagWords(writer, &.{spec.help_flag});
     try writer.writeAll("\" -- \"$cur\"))\n");
+
     try writer.writeAll(
         \\        else
         \\            COMPREPLY=($(compgen -W "
     );
-    for (spec.commands) |c| try writer.print("{s} ", .{c.name});
+    for (spec.commands) |cmd| {
+        try writer.print("{s} ", .{cmd.name});
+    }
     try writer.writeAll(
         \\" -- "$cur"))
         \\        fi
@@ -70,6 +77,7 @@ pub fn generateBash(writer: anytype, spec: CompletionSpec) !void {
         \\    case "$subcmd" in
         \\
     );
+
     for (spec.subcommands) |sub| {
         try writer.print("        {s})\n", .{sub.name});
         try writer.writeAll("            COMPREPLY=($(compgen -W \"");
@@ -81,6 +89,7 @@ pub fn generateBash(writer: anytype, spec: CompletionSpec) !void {
         }
         try writer.writeAll("            ;;\n");
     }
+
     try writer.writeAll("    esac\n}\n\n");
     try writer.print("complete -F _{s} {s}\n", .{ spec.command, spec.command });
 }
@@ -88,7 +97,9 @@ pub fn generateBash(writer: anytype, spec: CompletionSpec) !void {
 fn writeBashFlagWords(writer: anytype, flags: []const cli.FlagSpec) !void {
     for (flags) |flag| {
         try writer.print("--{s} ", .{flag.name});
-        if (flag.short) |s| try writer.print("-{c} ", .{s});
+        if (flag.short) |short| {
+            try writer.print("-{c} ", .{short});
+        }
     }
 }
 
@@ -103,7 +114,11 @@ pub fn generateZsh(writer: anytype, spec: CompletionSpec) !void {
         \\    commands=(
         \\
     );
-    for (spec.commands) |c| try writer.print("        \"{s}:{s}\"\n", .{ c.name, c.description });
+
+    for (spec.commands) |cmd| {
+        try writer.print("        \"{s}:{s}\"\n", .{ cmd.name, cmd.description });
+    }
+
     try writer.writeAll(
         \\    )
         \\
@@ -111,8 +126,12 @@ pub fn generateZsh(writer: anytype, spec: CompletionSpec) !void {
         \\        _arguments -C \
         \\
     );
-    for (spec.root.flags) |flag| try writeZshFlag(writer, "            ", flag);
+
+    for (spec.root.flags) |flag| {
+        try writeZshFlag(writer, "            ", flag);
+    }
     try writeZshFlag(writer, "            ", spec.help_flag);
+
     try writer.writeAll(
         \\            ':command:->command'
         \\        case $state in
@@ -127,22 +146,30 @@ pub fn generateZsh(writer: anytype, spec: CompletionSpec) !void {
         \\    case "$subcmd" in
         \\
     );
+
     for (spec.subcommands) |sub| {
         try writer.print("        {s})\n", .{sub.name});
         try writer.writeAll("            _arguments \\\n");
-        for (sub.flags) |flag| try writeZshFlag(writer, "                ", flag);
+        for (sub.flags) |flag| {
+            try writeZshFlag(writer, "                ", flag);
+        }
         try writeZshFlag(writer, "                ", spec.help_flag);
-        for (sub.arguments) |arg| try writeZshArg(writer, "                ", arg);
+        for (sub.arguments) |arg| {
+            try writeZshArg(writer, "                ", arg);
+        }
         try writer.writeAll("                && return\n");
-        if (hasFileArg(sub.arguments)) try writer.writeAll("            _files\n");
+        if (hasFileArg(sub.arguments)) {
+            try writer.writeAll("            _files\n");
+        }
         try writer.writeAll("            ;;\n");
     }
+
     try writer.writeAll("    esac\n}\n\n");
     try writer.print("compdef _{s} {s}\n", .{ spec.command, spec.command });
 }
 
 fn writeZshArg(writer: anytype, indent: []const u8, arg: cli.ArgumentSpec) !void {
-    const action = if (std.mem.eql(u8, arg.name, "FILE")) "_files" else "";
+    const action: []const u8 = if (std.mem.eql(u8, arg.name, "FILE")) "_files" else "";
     if (arg.repeatable) {
         try writer.print("{s}'*:{s}:{s}' \\\n", .{ indent, arg.name, action });
     } else if (arg.required) {
@@ -153,10 +180,10 @@ fn writeZshArg(writer: anytype, indent: []const u8, arg: cli.ArgumentSpec) !void
 }
 
 fn writeZshFlag(writer: anytype, indent: []const u8, flag: cli.FlagSpec) !void {
-    if (flag.short) |s| {
-        try writer.print("{s}'(-{c} --{s})'", .{ indent, s, flag.name });
+    if (flag.short) |short| {
+        try writer.print("{s}'(-{c} --{s})'", .{ indent, short, flag.name });
         try writer.writeByte('{');
-        try writer.print("-{c},--{s}", .{ s, flag.name });
+        try writer.print("-{c},--{s}", .{ short, flag.name });
         try writer.writeByte('}');
         if (takesValue(flag)) {
             try writer.print("'[{s}]:value:' \\\n", .{flag.name});
@@ -182,7 +209,9 @@ pub fn generateFish(writer: anytype, spec: CompletionSpec) !void {
     try writer.writeAll("    for i in (commandline -opc)\n");
     try writer.writeAll("        switch $i\n");
     try writer.writeAll("            case");
-    for (spec.commands) |c| try writer.print(" {s}", .{c.name});
+    for (spec.commands) |cmd| {
+        try writer.print(" {s}", .{cmd.name});
+    }
     try writer.writeAll(
         \\
         \\                return 1
@@ -194,49 +223,81 @@ pub fn generateFish(writer: anytype, spec: CompletionSpec) !void {
         \\
     );
 
-    const no_sub_fn = try std.fmt.allocPrint(std.heap.page_allocator, "__{s}_no_subcommand", .{spec.command});
-    defer std.heap.page_allocator.free(no_sub_fn);
+    const no_sub_cond = try std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "__{s}_no_subcommand",
+        .{spec.command},
+    );
+    defer std.heap.page_allocator.free(no_sub_cond);
 
-    for (spec.commands) |c| {
-        try writer.print("complete -c {s} -n {s} -a {s} -d \"{s}\"\n", .{ spec.command, no_sub_fn, c.name, c.description });
+    for (spec.commands) |cmd| {
+        try writer.print("complete -c {s} -n {s} -a {s} -d \"{s}\"\n", .{
+            spec.command,
+            no_sub_cond,
+            cmd.name,
+            cmd.description,
+        });
     }
     try writer.writeByte('\n');
 
     try writer.writeAll("# Root flags\n");
-    try writeFishFlags(writer, spec.command, no_sub_fn, spec.root.flags, spec.help_flag);
+    try writeFishFlags(writer, spec.command, no_sub_cond, spec.root.flags, spec.help_flag);
     try writer.writeByte('\n');
 
     for (spec.subcommands) |sub| {
         try writer.print("# {s}\n", .{sub.name});
         try writeFishFlags(writer, spec.command, sub.name, sub.flags, spec.help_flag);
         if (hasFileArg(sub.arguments)) {
-            try writer.print("complete -c {s} -n '__fish_seen_subcommand_from {s}' -F\n", .{ spec.command, sub.name });
+            try writer.print("complete -c {s} -n '__fish_seen_subcommand_from {s}' -F\n", .{
+                spec.command,
+                sub.name,
+            });
         }
         try writer.writeByte('\n');
     }
 }
 
-fn writeFishFlags(writer: anytype, command: []const u8, cond: []const u8, flags: []const cli.FlagSpec, help_flag: cli.FlagSpec) !void {
-    for (flags) |flag| try writeFishFlag(writer, command, cond, flag);
-    try writeFishFlag(writer, command, cond, help_flag);
+fn writeFishFlags(
+    writer: anytype,
+    command: []const u8,
+    condition: []const u8,
+    flags: []const cli.FlagSpec,
+    help_flag: cli.FlagSpec,
+) !void {
+    for (flags) |flag| {
+        try writeFishFlag(writer, command, condition, flag);
+    }
+    try writeFishFlag(writer, command, condition, help_flag);
 }
 
-fn writeFishFlag(writer: anytype, command: []const u8, cond: []const u8, flag: cli.FlagSpec) !void {
-    const is_func = std.mem.startsWith(u8, cond, "__");
-    const n = flag.short != null;
-    const r = takesValue(flag);
-    if (n) {
-        const s = flag.short.?;
-        if (is_func) {
-            try writer.print("complete -c {s} -n {s} -l {s} -s {c}{s}\n", .{ command, cond, flag.name, s, if (r) " -r" else "" });
+fn writeFishFlag(
+    writer: anytype,
+    command: []const u8,
+    condition: []const u8,
+    flag: cli.FlagSpec,
+) !void {
+    const is_function_condition = std.mem.startsWith(u8, condition, "__");
+    const requires_value: []const u8 = if (takesValue(flag)) " -r" else "";
+
+    if (flag.short) |short| {
+        if (is_function_condition) {
+            try writer.print("complete -c {s} -n {s} -l {s} -s {c}{s}\n", .{
+                command, condition, flag.name, short, requires_value,
+            });
         } else {
-            try writer.print("complete -c {s} -n '__fish_seen_subcommand_from {s}' -l {s} -s {c}{s}\n", .{ command, cond, flag.name, s, if (r) " -r" else "" });
+            try writer.print("complete -c {s} -n '__fish_seen_subcommand_from {s}' -l {s} -s {c}{s}\n", .{
+                command, condition, flag.name, short, requires_value,
+            });
         }
     } else {
-        if (is_func) {
-            try writer.print("complete -c {s} -n {s} -l {s}{s}\n", .{ command, cond, flag.name, if (r) " -r" else "" });
+        if (is_function_condition) {
+            try writer.print("complete -c {s} -n {s} -l {s}{s}\n", .{
+                command, condition, flag.name, requires_value,
+            });
         } else {
-            try writer.print("complete -c {s} -n '__fish_seen_subcommand_from {s}' -l {s}{s}\n", .{ command, cond, flag.name, if (r) " -r" else "" });
+            try writer.print("complete -c {s} -n '__fish_seen_subcommand_from {s}' -l {s}{s}\n", .{
+                command, condition, flag.name, requires_value,
+            });
         }
     }
 }

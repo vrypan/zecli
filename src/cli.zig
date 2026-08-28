@@ -10,8 +10,27 @@ pub const ValueKind = enum {
     bool_optional,
 };
 
+/// An external program consulted for completion candidates. Generated shell
+/// scripts invoke `executable` directly with `arguments` followed by the word
+/// being completed, and read one candidate per line from its stdout.
+pub const ExternalCompleter = struct {
+    executable: []const u8,
+    arguments: []const []const u8 = &.{},
+};
+
+/// How a shell should complete a flag value or a positional argument.
+pub const CompletionKind = union(enum) {
+    none,
+    files,
+    directories,
+    commands,
+    values: []const []const u8,
+    external: ExternalCompleter,
+};
+
 pub const FlagSpec = struct {
     name: []const u8,
+    aliases: []const []const u8 = &.{},
     short: ?u8 = null,
     value: ValueKind = .none,
     value_name: ?[]const u8 = null,
@@ -19,15 +38,8 @@ pub const FlagSpec = struct {
     default_value: ?[]const u8 = null,
     repeatable: bool = false,
     attached_short_value: bool = false,
-};
-
-pub const CommandSpec = struct {
-    name: []const u8,
-    description: []const u8,
-    usage: []const u8,
-    flags: []const FlagSpec = &.{},
-    arguments: []const ArgumentSpec = &.{},
-    extra_help: ?[]const u8 = null,
+    choices: []const []const u8 = &.{},
+    completion: CompletionKind = .none,
 };
 
 pub const ArgumentSpec = struct {
@@ -35,11 +47,33 @@ pub const ArgumentSpec = struct {
     description: []const u8 = "",
     required: bool = false,
     repeatable: bool = false,
+    completion: CompletionKind = .none,
 };
 
-pub const CommandEntry = struct {
+pub const CommandSpec = struct {
+    name: []const u8,
+    aliases: []const []const u8 = &.{},
+    description: []const u8,
+    usage: []const u8,
+    flags: []const FlagSpec = &.{},
+    arguments: []const ArgumentSpec = &.{},
+    extra_help: ?[]const u8 = null,
+};
+
+pub const ApplicationSpec = struct {
     name: []const u8,
     description: []const u8,
+    usage: []const u8,
+    flags: []const FlagSpec = &.{},
+    commands: []const CommandSpec = &.{},
+    extra_help: ?[]const u8 = null,
+};
+
+/// The help flag every generated help listing and completion script offers.
+pub const help_flag = FlagSpec{
+    .name = "help",
+    .short = 'h',
+    .description = "Print help",
 };
 
 const help_line_width = 120;
@@ -52,6 +86,14 @@ pub const FlagValue = struct {
 pub const Parsed = struct {
     flags: std.ArrayList(FlagValue) = .empty,
     positionals: std.ArrayList([]const u8) = .empty,
+
+    /// Releases the two buffers. Flag names and values are borrowed from argv
+    /// and from the specification, so they are not freed.
+    pub fn deinit(self: *Parsed, allocator: Allocator) void {
+        self.flags.deinit(allocator);
+        self.positionals.deinit(allocator);
+        self.* = .{};
+    }
 
     pub fn present(self: *const Parsed, name: []const u8) bool {
         for (self.flags.items) |flag| {
@@ -71,11 +113,203 @@ pub const Parsed = struct {
     }
 };
 
+// ── Lookup ───────────────────────────────────────────────────────────────────
+
+/// Resolves a command token, which may be a canonical name or an alias, to its
+/// canonical specification.
+pub fn findCommand(application: ApplicationSpec, token: []const u8) ?CommandSpec {
+    for (application.commands) |command| {
+        if (std.mem.eql(u8, command.name, token)) return command;
+        for (command.aliases) |alias| {
+            if (std.mem.eql(u8, alias, token)) return command;
+        }
+    }
+    return null;
+}
+
+/// Resolves a long option name, which may be a canonical name or an alias, to
+/// its canonical specification.
+pub fn findFlag(command: CommandSpec, token: []const u8) ?FlagSpec {
+    return findLong(command.flags, token);
+}
+
+/// Resolves a root long option name or alias to its canonical specification.
+pub fn findApplicationFlag(application: ApplicationSpec, token: []const u8) ?FlagSpec {
+    return findLong(application.flags, token);
+}
+
+fn findLong(specs: []const FlagSpec, name: []const u8) ?FlagSpec {
+    for (specs) |spec| {
+        if (std.mem.eql(u8, spec.name, name)) return spec;
+        for (spec.aliases) |alias| {
+            if (std.mem.eql(u8, alias, name)) return spec;
+        }
+    }
+    return null;
+}
+
+fn findShort(specs: []const FlagSpec, short: u8) ?FlagSpec {
+    for (specs) |spec| {
+        if (spec.short == short) return spec;
+    }
+    return null;
+}
+
+pub fn takesValue(flag: FlagSpec) bool {
+    return flag.value != .none;
+}
+
+/// The completion a shell should offer for a flag value: the explicit kind if
+/// one was declared, otherwise the declared choices.
+pub fn flagCompletion(flag: FlagSpec) CompletionKind {
+    if (flag.completion != .none) return flag.completion;
+    if (flag.choices.len > 0) return .{ .values = flag.choices };
+    return .none;
+}
+
+// ── Specification validation ─────────────────────────────────────────────────
+
+pub const SpecError = error{
+    InvalidName,
+    DuplicateName,
+    AliasEqualsName,
+    DuplicateShortOption,
+    RequiredArgumentAfterOptional,
+    RepeatableArgumentNotLast,
+    ChoicesWithoutValue,
+    CompletionWithoutValue,
+    ConflictingCompletion,
+    DefaultNotInChoices,
+};
+
+/// Command and long-option names use a conservative grammar that is safe in
+/// bash, zsh, and fish: an ASCII alphanumeric followed by ASCII alphanumerics
+/// or '-'.
+pub fn isValidName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!std.ascii.isAlphanumeric(name[0])) return false;
+    for (name[1..]) |char| {
+        if (!std.ascii.isAlphanumeric(char) and char != '-') return false;
+    }
+    return true;
+}
+
+fn validateFlags(flags: []const FlagSpec) SpecError!void {
+    for (flags, 0..) |flag, i| {
+        if (!isValidName(flag.name)) return error.InvalidName;
+        if (flag.short) |short| {
+            if (!std.ascii.isAlphanumeric(short)) return error.InvalidName;
+        }
+
+        for (flag.aliases) |alias| {
+            if (!isValidName(alias)) return error.InvalidName;
+            if (std.mem.eql(u8, alias, flag.name)) return error.AliasEqualsName;
+        }
+
+        if (!takesValue(flag)) {
+            if (flag.choices.len > 0) return error.ChoicesWithoutValue;
+            if (flag.completion != .none) return error.CompletionWithoutValue;
+        }
+
+        if (flag.choices.len > 0 and flag.completion != .none) {
+            return error.ConflictingCompletion;
+        }
+
+        if (flag.choices.len > 0) {
+            if (flag.default_value) |value| {
+                if (!containsString(flag.choices, value)) return error.DefaultNotInChoices;
+            }
+        }
+
+        // Duplicate long names, long aliases, and short options in this scope.
+        for (flags[i + 1 ..]) |other| {
+            if (namesOverlap(flag, other)) return error.DuplicateName;
+            if (flag.short != null and flag.short == other.short) {
+                return error.DuplicateShortOption;
+            }
+        }
+        for (flag.aliases, 0..) |alias, j| {
+            for (flag.aliases[j + 1 ..]) |other| {
+                if (std.mem.eql(u8, alias, other)) return error.DuplicateName;
+            }
+        }
+    }
+}
+
+fn namesOverlap(a: FlagSpec, b: FlagSpec) bool {
+    if (std.mem.eql(u8, a.name, b.name)) return true;
+    if (containsString(b.aliases, a.name)) return true;
+    for (a.aliases) |alias| {
+        if (std.mem.eql(u8, alias, b.name)) return true;
+        if (containsString(b.aliases, alias)) return true;
+    }
+    return false;
+}
+
+fn validateArgumentShape(arguments: []const ArgumentSpec) SpecError!void {
+    var seen_optional = false;
+    for (arguments, 0..) |argument, i| {
+        if (argument.required) {
+            if (seen_optional) return error.RequiredArgumentAfterOptional;
+        } else {
+            seen_optional = true;
+        }
+        if (argument.repeatable and i != arguments.len - 1) {
+            return error.RepeatableArgumentNotLast;
+        }
+    }
+}
+
+pub fn validateCommandSpec(spec: CommandSpec) SpecError!void {
+    if (!isValidName(spec.name)) return error.InvalidName;
+    for (spec.aliases, 0..) |alias, i| {
+        if (!isValidName(alias)) return error.InvalidName;
+        if (std.mem.eql(u8, alias, spec.name)) return error.AliasEqualsName;
+        for (spec.aliases[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, alias, other)) return error.DuplicateName;
+        }
+    }
+    try validateFlags(spec.flags);
+    try validateArgumentShape(spec.arguments);
+}
+
+pub fn validateApplicationSpec(application: ApplicationSpec) SpecError!void {
+    if (!isValidName(application.name)) return error.InvalidName;
+    try validateFlags(application.flags);
+
+    for (application.commands, 0..) |command, i| {
+        try validateCommandSpec(command);
+        for (application.commands[i + 1 ..]) |other| {
+            if (commandNamesOverlap(command, other)) return error.DuplicateName;
+        }
+    }
+}
+
+fn commandNamesOverlap(a: CommandSpec, b: CommandSpec) bool {
+    if (std.mem.eql(u8, a.name, b.name)) return true;
+    if (containsString(b.aliases, a.name)) return true;
+    for (a.aliases) |alias| {
+        if (std.mem.eql(u8, alias, b.name)) return true;
+        if (containsString(b.aliases, alias)) return true;
+    }
+    return false;
+}
+
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
+// ── Parsing ──────────────────────────────────────────────────────────────────
+
 const ParseIssue = enum {
     unknown_option,
     missing_value,
     invalid_int,
     invalid_bool,
+    invalid_choice,
     unexpected_inline_value,
     unsupported_short_cluster,
     attached_short_value,
@@ -89,6 +323,7 @@ const ParseDiagnostic = struct {
     flag_name: ?[]const u8 = null,
     value: ?[]const u8 = null,
     expected: ?[]const u8 = null,
+    choices: []const []const u8 = &.{},
 };
 
 pub fn parseCommand(
@@ -98,11 +333,12 @@ pub fn parseCommand(
     spec: CommandSpec,
 ) !Parsed {
     var diagnostic = ParseDiagnostic{};
-    const parsed = parseInternal(allocator, args, spec.flags, &diagnostic) catch |err| {
+    var parsed = parseInternal(allocator, args, spec.flags, &diagnostic) catch |err| {
         if (err != error.InvalidArgument) return err;
         try printParseError(writer, spec, diagnostic);
         return error.ReportedCliError;
     };
+    errdefer parsed.deinit(allocator);
     validateArguments(parsed.positionals.items, spec.arguments, &diagnostic) catch |err| {
         if (err != error.InvalidArgument) return err;
         try printParseError(writer, spec, diagnostic);
@@ -115,8 +351,11 @@ pub fn parse(allocator: Allocator, args: []const [:0]const u8, specs: []const Fl
     return parseInternal(allocator, args, specs, null);
 }
 
+/// Reports whether the caller should print help. Scanning stops at the first
+/// `--`, so `-h` and `--help` after the separator stay literal arguments.
 pub fn helpRequested(args: []const [:0]const u8) bool {
     for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
     }
     return false;
@@ -129,6 +368,8 @@ fn parseInternal(
     diagnostic: ?*ParseDiagnostic,
 ) !Parsed {
     var parsed = Parsed{};
+    errdefer parsed.deinit(allocator);
+
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -276,6 +517,7 @@ fn consumeValue(
                 };
             }
 
+            try checkChoices(spec, raw, token, diagnostic);
             return raw;
         },
         .bool_optional => {
@@ -301,12 +543,33 @@ fn consumeValue(
                 return error.InvalidArgument;
             };
 
+            try checkChoices(spec, raw, token, diagnostic);
             return raw;
         },
     }
 }
 
+fn checkChoices(
+    spec: FlagSpec,
+    value: []const u8,
+    token: []const u8,
+    diagnostic: ?*ParseDiagnostic,
+) !void {
+    if (spec.choices.len == 0) return;
+    if (containsString(spec.choices, value)) return;
+    setDiagnostic(diagnostic, .{
+        .issue = .invalid_choice,
+        .token = token,
+        .flag_name = spec.name,
+        .value = value,
+        .choices = spec.choices,
+    });
+    return error.InvalidArgument;
+}
+
 fn appendFlag(allocator: Allocator, parsed: *Parsed, spec: FlagSpec, value: ?[]const u8) !void {
+    // Values are always recorded under the canonical name, never under the
+    // alias the caller happened to type.
     if (!spec.repeatable) {
         for (parsed.flags.items) |*item| {
             if (std.mem.eql(u8, item.name, spec.name)) {
@@ -318,20 +581,6 @@ fn appendFlag(allocator: Allocator, parsed: *Parsed, spec: FlagSpec, value: ?[]c
     try parsed.flags.append(allocator, .{ .name = spec.name, .value = value });
 }
 
-fn findLong(specs: []const FlagSpec, name: []const u8) ?FlagSpec {
-    for (specs) |spec| {
-        if (std.mem.eql(u8, spec.name, name)) return spec;
-    }
-    return null;
-}
-
-fn findShort(specs: []const FlagSpec, short: u8) ?FlagSpec {
-    for (specs) |spec| {
-        if (spec.short == short) return spec;
-    }
-    return null;
-}
-
 fn validateArguments(
     positionals: []const []const u8,
     arguments: []const ArgumentSpec,
@@ -341,10 +590,9 @@ fn validateArguments(
     var max: usize = 0;
     var unlimited = false;
 
-    for (arguments, 0..) |argument, i| {
+    for (arguments) |argument| {
         if (argument.required) min += 1;
         if (argument.repeatable) {
-            std.debug.assert(i == arguments.len - 1);
             unlimited = true;
         } else {
             max += 1;
@@ -416,6 +664,17 @@ fn printParseError(writer: anytype, spec: CommandSpec, diagnostic: ParseDiagnost
             "error: invalid value for '--{s}': expected {s}, got '{s}'\n",
             .{ flag_name, diagnostic.expected orelse "BOOL", diagnostic.value orelse "" },
         ),
+        .invalid_choice => {
+            try writer.print(
+                "error: invalid value for '--{s}': '{s}' is not one of ",
+                .{ flag_name, diagnostic.value orelse "" },
+            );
+            for (diagnostic.choices, 0..) |choice, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try writer.print("'{s}'", .{choice});
+            }
+            try writer.writeByte('\n');
+        },
         .unexpected_inline_value => try writer.print(
             "error: option '--{s}' does not accept a value\n",
             .{diagnostic.flag_name orelse diagnostic.token},
@@ -457,12 +716,60 @@ fn commandLabel(spec: CommandSpec) []const u8 {
     return spec.usage[0..marker];
 }
 
+// ── Help ─────────────────────────────────────────────────────────────────────
+
+pub fn printApplicationHelp(allocator: Allocator, writer: anytype, application: ApplicationSpec) !void {
+    _ = try printWrapped(writer, application.description, 0, 0);
+    try writer.print("\n\nUsage: {s}\n", .{application.usage});
+    try printCommandList(allocator, writer, application.commands);
+    try printOptions(allocator, writer, application.flags, true);
+    if (application.extra_help) |extra| try writer.print("\n{s}", .{extra});
+}
+
 pub fn printCommandHelp(allocator: Allocator, writer: anytype, spec: CommandSpec) !void {
     _ = try printWrapped(writer, spec.description, 0, 0);
     try writer.print("\n\nUsage: {s}\n", .{spec.usage});
     try printArguments(writer, spec.arguments);
     try printOptions(allocator, writer, spec.flags, true);
     if (spec.extra_help) |extra| try writer.print("\n{s}", .{extra});
+}
+
+/// Renders "name" or "name, alias, alias" for the command list.
+fn commandLabelAlloc(allocator: Allocator, spec: CommandSpec) ![]const u8 {
+    if (spec.aliases.len == 0) return allocator.dupe(u8, spec.name);
+
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+    try buffer.appendSlice(allocator, spec.name);
+    for (spec.aliases) |alias| {
+        try buffer.appendSlice(allocator, ", ");
+        try buffer.appendSlice(allocator, alias);
+    }
+    return buffer.toOwnedSlice(allocator);
+}
+
+pub fn printCommandList(allocator: Allocator, writer: anytype, commands: []const CommandSpec) !void {
+    if (commands.len == 0) return;
+
+    try writer.writeAll("\nCommands:\n");
+
+    var max_label_len: usize = 0;
+    for (commands) |command| {
+        const label = try commandLabelAlloc(allocator, command);
+        defer allocator.free(label);
+        max_label_len = @max(max_label_len, label.len);
+    }
+
+    for (commands) |command| {
+        const label = try commandLabelAlloc(allocator, command);
+        defer allocator.free(label);
+
+        try writer.print("  {s}", .{label});
+        const description_col = max_label_len + 4;
+        try writeSpaces(writer, max_label_len - label.len + 2);
+        _ = try printWrapped(writer, command.description, description_col, description_col);
+        try writer.writeByte('\n');
+    }
 }
 
 pub fn printArguments(writer: anytype, arguments: []const ArgumentSpec) !void {
@@ -496,7 +803,9 @@ pub fn printOptions(
 
     var max_label_len: usize = 0;
     for (flags) |flag| {
-        max_label_len = @max(max_label_len, flagLabelLen(flag));
+        const label = try flagLabel(allocator, flag);
+        defer allocator.free(label);
+        max_label_len = @max(max_label_len, label.len);
     }
     if (include_help) {
         max_label_len = @max(max_label_len, "  -h, --help".len);
@@ -505,30 +814,11 @@ pub fn printOptions(
     for (flags) |flag| {
         const label = try flagLabel(allocator, flag);
         defer allocator.free(label);
-        try printOption(allocator, writer, label, flag.description, flag.default_value, flag.repeatable, max_label_len);
+        try printOption(allocator, writer, label, flag, max_label_len);
     }
 
     if (include_help) {
-        try printOption(allocator, writer, "  -h, --help", "Print help", null, false, max_label_len);
-    }
-}
-
-pub fn printCommandList(writer: anytype, commands: []const CommandEntry) !void {
-    if (commands.len == 0) return;
-
-    try writer.writeAll("\nCommands:\n");
-
-    var max_name_len: usize = 0;
-    for (commands) |command| {
-        max_name_len = @max(max_name_len, command.name.len);
-    }
-
-    for (commands) |command| {
-        try writer.print("  {s}", .{command.name});
-        const description_col = max_name_len + 4;
-        try writeSpaces(writer, max_name_len - command.name.len + 2);
-        _ = try printWrapped(writer, command.description, description_col, description_col);
-        try writer.writeByte('\n');
+        try printOption(allocator, writer, "  -h, --help", help_flag, max_label_len);
     }
 }
 
@@ -536,24 +826,34 @@ fn printOption(
     allocator: Allocator,
     writer: anytype,
     label: []const u8,
-    description: []const u8,
-    default_value: ?[]const u8,
-    repeatable: bool,
+    flag: FlagSpec,
     max_label_len: usize,
 ) !void {
     try writer.print("{s}", .{label});
     const description_col = max_label_len + 2;
     try writeSpaces(writer, max_label_len - label.len + 2);
 
-    var line_len = try printWrapped(writer, description, description_col, description_col);
+    var line_len = try printWrapped(writer, flag.description, description_col, description_col);
 
-    if (default_value) |value| {
+    if (flag.choices.len > 0) {
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(allocator);
+        try buffer.appendSlice(allocator, "[choices: ");
+        for (flag.choices, 0..) |choice, i| {
+            if (i > 0) try buffer.appendSlice(allocator, ", ");
+            try buffer.appendSlice(allocator, choice);
+        }
+        try buffer.append(allocator, ']');
+        line_len = try printWrapped(writer, buffer.items, description_col, line_len);
+    }
+
+    if (flag.default_value) |value| {
         const suffix = try std.fmt.allocPrint(allocator, "[default: {s}]", .{value});
         defer allocator.free(suffix);
         line_len = try printWrapped(writer, suffix, description_col, line_len);
     }
 
-    if (repeatable) {
+    if (flag.repeatable) {
         _ = try printWrapped(writer, "[repeatable]", description_col, line_len);
     }
 
@@ -618,37 +918,45 @@ fn printWrapped(writer: anytype, text: []const u8, indent: usize, initial_line_l
     return line_len;
 }
 
-fn flagLabelLen(spec: FlagSpec) usize {
-    const vname = getValueName(spec);
-    const short_prefix: usize = 6; // "  -x, " or "      "
-    const name_len = 2 + spec.name.len; // "--name"
-    const value_suffix: usize = switch (spec.value) {
-        .none => 0,
-        .string, .int, .bool_required => 3 + vname.len, // " <VALUE>"
-        .bool_optional => 3 + vname.len, // "[=VALUE]"
-    };
-    return short_prefix + name_len + value_suffix;
-}
-
+/// Renders "  -n, --name, --nom <TEXT>" for the option list.
 fn flagLabel(allocator: Allocator, spec: FlagSpec) ![]const u8 {
-    const vname = getValueName(spec);
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
 
     if (spec.short) |short| {
-        return switch (spec.value) {
-            .none => try std.fmt.allocPrint(allocator, "  -{c}, --{s}", .{ short, spec.name }),
-            .string, .int, .bool_required => try std.fmt.allocPrint(allocator, "  -{c}, --{s} <{s}>", .{ short, spec.name, vname }),
-            .bool_optional => try std.fmt.allocPrint(allocator, "  -{c}, --{s}[={s}]", .{ short, spec.name, vname }),
-        };
+        try buffer.appendSlice(allocator, "  -");
+        try buffer.append(allocator, short);
+        try buffer.appendSlice(allocator, ", ");
+    } else {
+        try buffer.appendSlice(allocator, "      ");
     }
 
-    return switch (spec.value) {
-        .none => try std.fmt.allocPrint(allocator, "      --{s}", .{spec.name}),
-        .string, .int, .bool_required => try std.fmt.allocPrint(allocator, "      --{s} <{s}>", .{ spec.name, vname }),
-        .bool_optional => try std.fmt.allocPrint(allocator, "      --{s}[={s}]", .{ spec.name, vname }),
-    };
+    try buffer.appendSlice(allocator, "--");
+    try buffer.appendSlice(allocator, spec.name);
+    for (spec.aliases) |alias| {
+        try buffer.appendSlice(allocator, ", --");
+        try buffer.appendSlice(allocator, alias);
+    }
+
+    const value_name = getValueName(spec);
+    switch (spec.value) {
+        .none => {},
+        .string, .int, .bool_required => {
+            try buffer.appendSlice(allocator, " <");
+            try buffer.appendSlice(allocator, value_name);
+            try buffer.append(allocator, '>');
+        },
+        .bool_optional => {
+            try buffer.appendSlice(allocator, "[=");
+            try buffer.appendSlice(allocator, value_name);
+            try buffer.append(allocator, ']');
+        },
+    }
+
+    return buffer.toOwnedSlice(allocator);
 }
 
-fn getValueName(spec: FlagSpec) []const u8 {
+pub fn getValueName(spec: FlagSpec) []const u8 {
     if (spec.value_name) |name| return name;
     return switch (spec.value) {
         .none => "",

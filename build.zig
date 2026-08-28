@@ -13,16 +13,19 @@ pub fn build(b: *std.Build) void {
     });
     completion_mod.addImport("cli", cli_mod);
 
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_mod.addImport("cli", cli_mod);
-
-    const tests = b.addTest(.{ .root_module = test_mod });
-
-    const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&run_tests.step);
+
+    const roots = [_][]const u8{ "src/test.zig", "src/completion_test.zig" };
+    for (roots) |root| {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path(root),
+            .target = target,
+            .optimize = optimize,
+        });
+        test_mod.addImport("cli", cli_mod);
+        test_mod.addImport("completion", completion_mod);
+
+        const tests = b.addTest(.{ .root_module = test_mod });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
 }

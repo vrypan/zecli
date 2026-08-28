@@ -1,0 +1,279 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: |
+          zig fmt --check src/cli.zig src/completion.zig src/test.zig \
+            src/completion_test.zig example/src/main.zig build.zig example/build.zig
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build the example
+        run: zig build
+        working-directory: example
+
+      - name: Check generated help
+        working-directory: example
+        run: |
+          ./zig-out/bin/zecli-example --help
+          ./zig-out/bin/zecli-example greet --help
+
+  shells:
+    name: Shell completions
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y zsh fish
+
+      - name: Build the example
+        run: zig build
+        working-directory: example
+
+      - name: Generate completion scripts
+        working-directory: example
+        run: |
+          ./zig-out/bin/zecli-example completion bash > "$RUNNER_TEMP/completion.bash"
+          ./zig-out/bin/zecli-example completion zsh  > "$RUNNER_TEMP/completion.zsh"
+          ./zig-out/bin/zecli-example completion fish > "$RUNNER_TEMP/completion.fish"
+          for shell in bash zsh fish; do
+            test -s "$RUNNER_TEMP/completion.$shell" || {
+              echo "generated $shell completion is empty"; exit 1;
+            }
+          done
+
+      - name: Check completion script syntax
+        run: |
+          bash -n "$RUNNER_TEMP/completion.bash"
+          zsh -n "$RUNNER_TEMP/completion.zsh"
+          fish -n "$RUNNER_TEMP/completion.fish"
+
+      # The syntax checks above only prove the scripts parse. The three steps
+      # below run each shell's real completion machinery and assert on the
+      # candidates it actually produces.
+
+      - name: Behavioral test (bash)
+        working-directory: example
+        run: |
+          cat > "$RUNNER_TEMP/smoke.bash" <<'SCRIPT'
+          set -u
+          source "$1"
+          fail=0
+
+          candidates() {
+              COMP_WORDS=("$@")
+              COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+              COMPREPLY=()
+              _zecli_example
+          }
+
+          check() {
+              local label="$1" expected="$2"; shift 2
+              candidates "$@"
+              local item
+              for item in "${COMPREPLY[@]-}"; do
+                  if [ "$item" = "$expected" ]; then echo "ok   - $label"; return; fi
+              done
+              echo "FAIL - $label (expected '$expected', got: ${COMPREPLY[*]-})"
+              fail=1
+          }
+
+          refute() {
+              local label="$1" unexpected="$2"; shift 2
+              candidates "$@"
+              local item
+              for item in "${COMPREPLY[@]-}"; do
+                  if [ "$item" = "$unexpected" ]; then
+                      echo "FAIL - $label (did not expect '$unexpected')"; fail=1; return
+                  fi
+              done
+              echo "ok   - $label"
+          }
+
+          check "commands offered"          greet             zecli-example ""
+          check "alias offered"             hi                zecli-example ""
+          check "root option before cmd"    greet             zecli-example --home /tmp gr
+          check "inline root option value"  greet             zecli-example --home=/tmp gr
+          check "option value is not a cmd" greet             zecli-example --home greet ""
+          check "command options"           --color           zecli-example greet -
+          check "long option alias"         --colour          zecli-example greet -
+          check "choices"                   always            zecli-example greet --color ""
+          check "choices via alias"         always            zecli-example greet --colour ""
+          check "choices after ="           always            zecli-example greet --color = ""
+          refute "no options after --"      --color           zecli-example greet -- -
+          check "external candidate"        "note with space" zecli-example cat --ref ""
+          check "external prefix"           "@42/out"         zecli-example cat --ref @4
+
+          exit "$fail"
+          SCRIPT
+          PATH="$PWD/zig-out/bin:$PATH" bash "$RUNNER_TEMP/smoke.bash" "$RUNNER_TEMP/completion.bash"
+
+      - name: Behavioral test (fish)
+        working-directory: example
+        run: |
+          cat > "$RUNNER_TEMP/smoke.fish" <<'SCRIPT'
+          source $argv[1]
+          set -g fail 0
+
+          function check
+              set -l result (complete -C $argv[3] | string split -f1 \t)
+              if contains -- $argv[2] $result
+                  echo "ok   - $argv[1]"
+              else
+                  echo "FAIL - $argv[1] (expected '$argv[2]', got: $result)"
+                  set -g fail 1
+              end
+          end
+
+          function refute
+              set -l result (complete -C $argv[3] | string split -f1 \t)
+              if contains -- $argv[2] $result
+                  echo "FAIL - $argv[1] (did not expect '$argv[2]')"
+                  set -g fail 1
+              else
+                  echo "ok   - $argv[1]"
+              end
+          end
+
+          check "commands offered" greet 'zecli-example '
+          check "alias offered" hi 'zecli-example '
+          check "root option before cmd" greet 'zecli-example --home /tmp gr'
+          check "inline root option value" greet 'zecli-example --home=/tmp gr'
+          check "option value is not a cmd" greet 'zecli-example --home greet '
+          check "command options" --color 'zecli-example greet -'
+          check "long option alias" --colour 'zecli-example greet -'
+          check "choices" always 'zecli-example greet --color '
+          check "choices via alias" always 'zecli-example greet --colour '
+          refute "no options after --" --color 'zecli-example greet -- -'
+          check "external candidate" "note with space" 'zecli-example cat --ref '
+          check "external prefix" "@42/out" 'zecli-example cat --ref @4'
+
+          exit $fail
+          SCRIPT
+          PATH="$PWD/zig-out/bin:$PATH" fish "$RUNNER_TEMP/smoke.fish" "$RUNNER_TEMP/completion.fish"
+
+      - name: Behavioral test (zsh)
+        working-directory: example
+        timeout-minutes: 5
+        run: |
+          cat > "$RUNNER_TEMP/smoke.zsh" <<'SCRIPT'
+          # zsh completion only runs inside ZLE, so drive a real zsh in a pty and
+          # capture the matches where they are added rather than parsing output.
+          emulate -L zsh
+          zmodload zsh/zpty
+
+          script=$1
+          work=${TMPDIR:-/tmp}/zecli-smoke.$$
+          mkdir -p $work
+          cap=$work/capture
+          : > $cap
+          typeset -g out fail=0 sync=0
+
+          zpty zt zsh -f -i
+          zpty -w zt "PS1='ZMARK '"
+          zpty -r -m zt out '*ZMARK *' || { print "FAIL - no zsh pty"; exit 1 }
+
+          send() {
+              (( sync++ ))
+              local tag="SYNC${sync}DONE"
+              zpty -w zt "$1; print $tag"
+              zpty -r -m zt out "*${tag}*ZMARK *"
+          }
+
+          send "autoload -Uz compinit && compinit -u -d $work/dump" || exit 1
+          send "source ${(q)script}" || exit 1
+          send "compadd() { local -a __m; builtin compadd -O __m \"\$@\"; print -lr -- \"\${__m[@]}\" >> ${(q)cap}; builtin compadd \"\$@\" }" || exit 1
+
+          complete_line() {
+              : > $cap
+              zpty -w -n zt "$1"$'\t'
+              local waited=0
+              while (( waited < 100 )) && [[ ! -s $cap ]]; do
+                  sleep 0.1
+                  (( waited++ ))
+              done
+              sleep 0.5
+              zpty -w -n zt $'\C-c'
+              send "true"
+          }
+
+          check() {
+              complete_line $3
+              if grep -qxF -- "$2" $cap 2>/dev/null; then
+                  print "ok   - $1"
+              else
+                  print "FAIL - $1 (expected '$2')"
+                  fail=1
+              fi
+          }
+
+          refute() {
+              complete_line $3
+              if grep -qxF -- "$2" $cap 2>/dev/null; then
+                  print "FAIL - $1 (did not expect '$2')"
+                  fail=1
+              else
+                  print "ok   - $1"
+              fi
+          }
+
+          check "commands offered" greet 'zecli-example '
+          check "alias offered" hi 'zecli-example '
+          check "root option before cmd" greet 'zecli-example --home /tmp gr'
+          check "inline root option value" greet 'zecli-example --home=/tmp gr'
+          check "option value is not a cmd" greet 'zecli-example --home greet '
+          check "command options" --color 'zecli-example greet -'
+          check "long option alias" --colour 'zecli-example greet -'
+          check "choices" always 'zecli-example greet --color '
+          check "choices via alias" always 'zecli-example greet --colour '
+          refute "no options after --" --color 'zecli-example greet -- -'
+          check "external candidate" 'note with space' 'zecli-example cat --ref '
+          check "external prefix" '@42/out' 'zecli-example cat --ref @4'
+
+          zpty -d zt
+          rm -rf $work
+          exit $fail
+          SCRIPT
+          PATH="$PWD/zig-out/bin:$PATH" zsh "$RUNNER_TEMP/smoke.zsh" "$RUNNER_TEMP/completion.zsh"

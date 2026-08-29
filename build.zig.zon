@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xce0f806c93755e8f,
     .name = .zecli,
-    .version = "0.2.1",
+    .version = "0.2.2",
     .dependencies = .{},
     .minimum_zig_version = "0.16.0",
     .paths = .{

@@ -361,12 +361,12 @@ Out of scope: nested subcommands, action callbacks, middleware, dependency
 injection, prompts or terminal UI, configuration-file support, Windows shell
 completion, and delegating completion to a wrapped command after `--`.
 
-## Migrating from 0.2.x
+## Migrating from 0.2.1
 
-`0.3.0` changes one signature. `printCommandList` no longer takes an
+`0.2.2` changes one signature. `printCommandList` no longer takes an
 allocator, because it now measures and writes labels without building them:
 
-| 0.2.x | 0.3.0 |
+| 0.2.1 | 0.2.2 |
 |---|---|
 | `cli.printCommandList(allocator, writer, commands)` | `cli.printCommandList(writer, commands)` |
 

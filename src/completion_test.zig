@@ -378,6 +378,13 @@ test "zsh: describes commands and their aliases" {
     try expectContains(buffer.items(), "'search:Search entries'");
 }
 
+test "zsh: dispatches on the first completion when autoloaded from fpath" {
+    var buffer = try generate(testing.allocator, .zsh);
+    defer buffer.deinit();
+    try expectContains(buffer.items(), "if [ \"${funcstack[1]}\" = \"_demo\" ]; then\n    _demo \"$@\"\nelse\n");
+    try expectContains(buffer.items(), "    compdef _demo demo\nfi\n");
+}
+
 test "zsh: reports the dispatched command's completion status" {
     var buffer = try generate(testing.allocator, .zsh);
     defer buffer.deinit();

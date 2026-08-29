@@ -767,11 +767,20 @@ pub fn generateZsh(writer: anytype, app: cli.ApplicationSpec) !void {
         \\
     );
 
-    try writer.writeAll("compdef ");
+    // Autoloaded from fpath, this file's body *is* the body of the function
+    // named after the file, so it must dispatch rather than only register:
+    // otherwise the first completion attempt defines the functions and
+    // returns without completing anything. Sourced from a startup file,
+    // funcstack is empty and the compdef registration is what's needed.
+    try writer.writeAll("if [ \"${funcstack[1]}\" = \"_");
+    try writer.writeAll(app.name);
+    try writer.writeAll("\" ]; then\n    ");
+    try writePrefix(writer, app);
+    try writer.writeAll(" \"$@\"\nelse\n    compdef ");
     try writePrefix(writer, app);
     try writer.writeAll(" ");
     try writer.writeAll(app.name);
-    try writer.writeAll("\n");
+    try writer.writeAll("\nfi\n");
 }
 
 fn writeZshExternal(

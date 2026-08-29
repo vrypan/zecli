@@ -78,6 +78,10 @@ pub const help_flag = FlagSpec{
 
 const help_line_width = 120;
 
+/// Stack space for the `[choices: ...]` and `[default: ...]` suffixes, past
+/// which `printOption` falls back to its allocator.
+const suffix_stack_size = 256;
+
 pub const FlagValue = struct {
     name: []const u8,
     value: ?[]const u8 = null,
@@ -271,6 +275,28 @@ pub fn validateCommandSpec(spec: CommandSpec) SpecError!void {
     }
     try validateFlags(spec.flags);
     try validateArgumentShape(spec.arguments);
+}
+
+/// Validates a specification at compile time and returns it unchanged, so an
+/// invalid specification is a compile error rather than a runtime one and the
+/// validation code never reaches the binary:
+///
+///     const application = cli.comptimeValidated(.{
+///         .name = "demo",
+///         .description = "A demo",
+///         .usage = "demo [options] <command>",
+///         .commands = &commands,
+///     });
+///
+/// Every field must be comptime-known. A specification built at runtime has to
+/// use `validateApplicationSpec` instead.
+pub fn comptimeValidated(comptime application: ApplicationSpec) ApplicationSpec {
+    comptime {
+        validateApplicationSpec(application) catch |err| @compileError(
+            "invalid ApplicationSpec '" ++ application.name ++ "': " ++ @errorName(err),
+        );
+    }
+    return application;
 }
 
 pub fn validateApplicationSpec(application: ApplicationSpec) SpecError!void {
@@ -721,7 +747,7 @@ fn commandLabel(spec: CommandSpec) []const u8 {
 pub fn printApplicationHelp(allocator: Allocator, writer: anytype, application: ApplicationSpec) !void {
     _ = try printWrapped(writer, application.description, 0, 0);
     try writer.print("\n\nUsage: {s}\n", .{application.usage});
-    try printCommandList(allocator, writer, application.commands);
+    try printCommandList(writer, application.commands);
     try printOptions(allocator, writer, application.flags, true);
     if (application.extra_help) |extra| try writer.print("\n{s}", .{extra});
 }
@@ -734,39 +760,38 @@ pub fn printCommandHelp(allocator: Allocator, writer: anytype, spec: CommandSpec
     if (spec.extra_help) |extra| try writer.print("\n{s}", .{extra});
 }
 
-/// Renders "name" or "name, alias, alias" for the command list.
-fn commandLabelAlloc(allocator: Allocator, spec: CommandSpec) ![]const u8 {
-    if (spec.aliases.len == 0) return allocator.dupe(u8, spec.name);
-
-    var buffer: std.ArrayList(u8) = .empty;
-    errdefer buffer.deinit(allocator);
-    try buffer.appendSlice(allocator, spec.name);
-    for (spec.aliases) |alias| {
-        try buffer.appendSlice(allocator, ", ");
-        try buffer.appendSlice(allocator, alias);
-    }
-    return buffer.toOwnedSlice(allocator);
+/// Width of "name" or "name, alias, alias", computed without building it, so
+/// that the column measuring pass costs no allocation.
+fn commandLabelLen(spec: CommandSpec) usize {
+    var len = spec.name.len;
+    for (spec.aliases) |alias| len += ", ".len + alias.len;
+    return len;
 }
 
-pub fn printCommandList(allocator: Allocator, writer: anytype, commands: []const CommandSpec) !void {
+/// Writes what `commandLabelLen` measures.
+fn writeCommandLabel(writer: anytype, spec: CommandSpec) !void {
+    try writer.writeAll(spec.name);
+    for (spec.aliases) |alias| {
+        try writer.writeAll(", ");
+        try writer.writeAll(alias);
+    }
+}
+
+pub fn printCommandList(writer: anytype, commands: []const CommandSpec) !void {
     if (commands.len == 0) return;
 
     try writer.writeAll("\nCommands:\n");
 
     var max_label_len: usize = 0;
     for (commands) |command| {
-        const label = try commandLabelAlloc(allocator, command);
-        defer allocator.free(label);
-        max_label_len = @max(max_label_len, label.len);
+        max_label_len = @max(max_label_len, commandLabelLen(command));
     }
 
     for (commands) |command| {
-        const label = try commandLabelAlloc(allocator, command);
-        defer allocator.free(label);
-
-        try writer.print("  {s}", .{label});
+        try writer.writeAll("  ");
+        try writeCommandLabel(writer, command);
         const description_col = max_label_len + 4;
-        try writeSpaces(writer, max_label_len - label.len + 2);
+        try writeSpaces(writer, max_label_len - commandLabelLen(command) + 2);
         _ = try printWrapped(writer, command.description, description_col, description_col);
         try writer.writeByte('\n');
     }
@@ -803,53 +828,54 @@ pub fn printOptions(
 
     var max_label_len: usize = 0;
     for (flags) |flag| {
-        const label = try flagLabel(allocator, flag);
-        defer allocator.free(label);
-        max_label_len = @max(max_label_len, label.len);
+        max_label_len = @max(max_label_len, flagLabelLen(flag));
     }
     if (include_help) {
-        max_label_len = @max(max_label_len, "  -h, --help".len);
+        max_label_len = @max(max_label_len, flagLabelLen(help_flag));
     }
 
     for (flags) |flag| {
-        const label = try flagLabel(allocator, flag);
-        defer allocator.free(label);
-        try printOption(allocator, writer, label, flag, max_label_len);
+        try printOption(allocator, writer, flag, max_label_len);
     }
 
     if (include_help) {
-        try printOption(allocator, writer, "  -h, --help", help_flag, max_label_len);
+        try printOption(allocator, writer, help_flag, max_label_len);
     }
 }
 
 fn printOption(
     allocator: Allocator,
     writer: anytype,
-    label: []const u8,
     flag: FlagSpec,
     max_label_len: usize,
 ) !void {
-    try writer.print("{s}", .{label});
+    try writeFlagLabel(writer, flag);
     const description_col = max_label_len + 2;
-    try writeSpaces(writer, max_label_len - label.len + 2);
+    try writeSpaces(writer, max_label_len - flagLabelLen(flag) + 2);
 
     var line_len = try printWrapped(writer, flag.description, description_col, description_col);
 
+    // The suffixes have to be contiguous for printWrapped to break them on
+    // word boundaries, but they are short: a stack buffer covers every
+    // realistic option, and the allocator only takes over past that.
+    var fallback = std.heap.stackFallback(suffix_stack_size, allocator);
+    const suffix_allocator = fallback.get();
+
     if (flag.choices.len > 0) {
         var buffer: std.ArrayList(u8) = .empty;
-        defer buffer.deinit(allocator);
-        try buffer.appendSlice(allocator, "[choices: ");
+        defer buffer.deinit(suffix_allocator);
+        try buffer.appendSlice(suffix_allocator, "[choices: ");
         for (flag.choices, 0..) |choice, i| {
-            if (i > 0) try buffer.appendSlice(allocator, ", ");
-            try buffer.appendSlice(allocator, choice);
+            if (i > 0) try buffer.appendSlice(suffix_allocator, ", ");
+            try buffer.appendSlice(suffix_allocator, choice);
         }
-        try buffer.append(allocator, ']');
+        try buffer.append(suffix_allocator, ']');
         line_len = try printWrapped(writer, buffer.items, description_col, line_len);
     }
 
     if (flag.default_value) |value| {
-        const suffix = try std.fmt.allocPrint(allocator, "[default: {s}]", .{value});
-        defer allocator.free(suffix);
+        const suffix = try std.fmt.allocPrint(suffix_allocator, "[default: {s}]", .{value});
+        defer suffix_allocator.free(suffix);
         line_len = try printWrapped(writer, suffix, description_col, line_len);
     }
 
@@ -919,41 +945,54 @@ fn printWrapped(writer: anytype, text: []const u8, indent: usize, initial_line_l
 }
 
 /// Renders "  -n, --name, --nom <TEXT>" for the option list.
-fn flagLabel(allocator: Allocator, spec: FlagSpec) ![]const u8 {
-    var buffer: std.ArrayList(u8) = .empty;
-    errdefer buffer.deinit(allocator);
+/// Width of an option label, computed without building it, so that the column
+/// measuring pass costs no allocation.
+fn flagLabelLen(spec: FlagSpec) usize {
+    // "  -s, " or the six spaces that stand in for a missing short option.
+    var len: usize = 6;
+    len += "--".len + spec.name.len;
+    for (spec.aliases) |alias| len += ", --".len + alias.len;
+    len += switch (spec.value) {
+        .none => 0,
+        // " <NAME>"
+        .string, .int, .bool_required => 3 + getValueName(spec).len,
+        // "[=NAME]"
+        .bool_optional => 3 + getValueName(spec).len,
+    };
+    return len;
+}
 
+/// Writes what `flagLabelLen` measures.
+fn writeFlagLabel(writer: anytype, spec: FlagSpec) !void {
     if (spec.short) |short| {
-        try buffer.appendSlice(allocator, "  -");
-        try buffer.append(allocator, short);
-        try buffer.appendSlice(allocator, ", ");
+        try writer.writeAll("  -");
+        try writer.writeByte(short);
+        try writer.writeAll(", ");
     } else {
-        try buffer.appendSlice(allocator, "      ");
+        try writer.writeAll("      ");
     }
 
-    try buffer.appendSlice(allocator, "--");
-    try buffer.appendSlice(allocator, spec.name);
+    try writer.writeAll("--");
+    try writer.writeAll(spec.name);
     for (spec.aliases) |alias| {
-        try buffer.appendSlice(allocator, ", --");
-        try buffer.appendSlice(allocator, alias);
+        try writer.writeAll(", --");
+        try writer.writeAll(alias);
     }
 
     const value_name = getValueName(spec);
     switch (spec.value) {
         .none => {},
         .string, .int, .bool_required => {
-            try buffer.appendSlice(allocator, " <");
-            try buffer.appendSlice(allocator, value_name);
-            try buffer.append(allocator, '>');
+            try writer.writeAll(" <");
+            try writer.writeAll(value_name);
+            try writer.writeByte('>');
         },
         .bool_optional => {
-            try buffer.appendSlice(allocator, "[=");
-            try buffer.appendSlice(allocator, value_name);
-            try buffer.append(allocator, ']');
+            try writer.writeAll("[=");
+            try writer.writeAll(value_name);
+            try writer.writeByte(']');
         },
     }
-
-    return buffer.toOwnedSlice(allocator);
 }
 
 pub fn getValueName(spec: FlagSpec) []const u8 {

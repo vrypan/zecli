@@ -140,20 +140,15 @@ const commands = [_]cli.CommandSpec{
     },
 };
 
-const application = cli.ApplicationSpec{
+// Specification mistakes are build errors rather than runtime surprises, and
+// the validation never reaches the binary.
+const application = cli.comptimeValidated(.{
     .name = "zecli-example",
     .description = "Small example program using zecli.",
     .usage = "zecli-example [options] <command>",
     .flags = &root_flags,
     .commands = &commands,
-};
-
-// Specification mistakes are build errors rather than runtime surprises.
-comptime {
-    cli.validateApplicationSpec(application) catch |err| {
-        @compileError("invalid application specification: " ++ @errorName(err));
-    };
-}
+});
 
 // Candidates the external completer offers, including one containing a space
 // to show that a candidate is never split.

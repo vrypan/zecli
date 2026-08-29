@@ -1019,6 +1019,67 @@ test "printApplicationHelp: shows each alias exactly once" {
     try testing.expectEqual(@as(usize, 1), countOccurrences(buffer.items(), "history"));
 }
 
+/// Counts every allocation made through it, so a test can assert that help
+/// printing stays off the heap.
+const CountingAllocator = struct {
+    parent: std.mem.Allocator,
+    count: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        return self.parent.rawAlloc(n, a, ra);
+    }
+
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.parent.rawResize(m, a, n, ra);
+    }
+
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.parent.rawRemap(m, a, n, ra);
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(m, a, ra);
+    }
+};
+
+test "help printing does not allocate" {
+    var counting = CountingAllocator{ .parent = testing.allocator };
+    const allocator = counting.allocator();
+
+    try cli.printApplicationHelp(allocator, nw, demo_app);
+    for (demo_app.commands) |command| {
+        try cli.printCommandHelp(allocator, nw, command);
+    }
+
+    try testing.expectEqual(@as(usize, 0), counting.count);
+}
+
+test "comptimeValidated returns the specification unchanged" {
+    const application = cli.comptimeValidated(.{
+        .name = "demo",
+        .description = "Demo application.",
+        .usage = "demo [options] <command>",
+        .flags = demo_app.flags,
+        .commands = demo_app.commands,
+    });
+    try testing.expectEqualStrings("demo", application.name);
+    try testing.expectEqual(demo_app.commands.len, application.commands.len);
+}
+
 test "printCommandHelp: shows option aliases, choices, and defaults" {
     var buffer = Buffer.init(testing.allocator);
     defer buffer.deinit();

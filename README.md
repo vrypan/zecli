@@ -112,15 +112,23 @@ alphanumeric. This grammar is what makes generated completions safe in all
 three shells. Descriptions, usage text, value names, and completion values are
 arbitrary UTF-8 and are quoted by the generators.
 
-Run validation at compile time so a mistake is a build error:
+`comptimeValidated` runs that check at compile time and returns the
+specification unchanged, so a mistake is a build error and the validation code
+never reaches the binary:
 
 ```zig
-comptime {
-    cli.validateApplicationSpec(application) catch |err| {
-        @compileError("invalid application specification: " ++ @errorName(err));
-    };
-}
+const application = cli.comptimeValidated(.{
+    .name = "demo",
+    .description = "A demo",
+    .usage = "demo [options] <command>",
+    .commands = &commands,
+});
 ```
+
+A duplicate command name then fails the build with
+`invalid ApplicationSpec 'demo': DuplicateName`, pointing at the declaration.
+Every field must be comptime-known; a specification assembled at runtime calls
+`validateApplicationSpec` directly instead.
 
 ## Parsing
 
@@ -352,6 +360,23 @@ generated help, and bash/zsh/fish completion.
 Out of scope: nested subcommands, action callbacks, middleware, dependency
 injection, prompts or terminal UI, configuration-file support, Windows shell
 completion, and delegating completion to a wrapped command after `--`.
+
+## Migrating from 0.2.x
+
+`0.3.0` changes one signature. `printCommandList` no longer takes an
+allocator, because it now measures and writes labels without building them:
+
+| 0.2.x | 0.3.0 |
+|---|---|
+| `cli.printCommandList(allocator, writer, commands)` | `cli.printCommandList(writer, commands)` |
+
+`printApplicationHelp`, `printCommandHelp`, and `printOptions` keep their
+signatures. Help printing no longer allocates for anything but an unusually
+long `[choices: ...]` or `[default: ...]` suffix, which still needs the
+allocator those three take.
+
+`cli.comptimeValidated` is new and additive; the hand-written `comptime`
+block it replaces keeps working.
 
 ## Migrating from 0.1.x
 

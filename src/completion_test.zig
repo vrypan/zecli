@@ -378,6 +378,12 @@ test "zsh: describes commands and their aliases" {
     try expectContains(buffer.items(), "'search:Search entries'");
 }
 
+test "zsh: reports the dispatched command's completion status" {
+    var buffer = try generate(testing.allocator, .zsh);
+    defer buffer.deinit();
+    try expectContains(buffer.items(), "__cmd_grep\n                    return $?\n");
+}
+
 test "zsh: completes files, directories, and executables from metadata" {
     var buffer = try generate(testing.allocator, .zsh);
     defer buffer.deinit();

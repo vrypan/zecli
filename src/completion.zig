@@ -752,7 +752,10 @@ pub fn generateZsh(writer: anytype, app: cli.ApplicationSpec) !void {
         try writeBashCommandPattern(writer, command);
         try writer.writeAll(")\n                    ");
         try writeCommandFnName(writer, app, command);
-        try writer.writeAll("\n                    ;;\n");
+        // Propagate the command function's status: returning 1 unconditionally
+        // makes zsh retry the whole completion once per configured matcher,
+        // which duplicates every group it produced.
+        try writer.writeAll("\n                    return $?\n                    ;;\n");
     }
     try writer.writeAll(
         \\            esac

@@ -459,11 +459,26 @@ test "fish: applies a command's options to its aliases too" {
     try expectContains(buffer.items(), "__demo_using_command grep search");
 }
 
-test "fish: marks value-taking options as requiring an argument" {
+test "fish: value-taking options take their value exclusively" {
     var buffer = try generate(testing.allocator, .fish);
     defer buffer.deinit();
-    try expectContains(buffer.items(), "-l home -s H -r");
-    try expectContains(buffer.items(), "-l colour -r");
+    // -x, not -r: -r alone lets fish add filenames to the declared values.
+    try expectContains(buffer.items(), "-l home -s H -x");
+    try expectContains(buffer.items(), "-l colour -x");
+    try expectMissing(buffer.items(), " -r ");
+}
+
+test "bash: path helpers escape spaces and mark directories" {
+    var buffer = try generate(testing.allocator, .bash);
+    defer buffer.deinit();
+    try expectContains(buffer.items(), "_files() {\n    COMPREPLY=()\n    compopt -o filenames");
+    try expectContains(buffer.items(), "_dirs() {\n    COMPREPLY=()\n    compopt -o filenames");
+}
+
+test "zsh: narrows the context to the dispatched subcommand" {
+    var buffer = try generate(testing.allocator, .zsh);
+    defer buffer.deinit();
+    try expectContains(buffer.items(), "curcontext=\"${curcontext%:*:*}:demo-${words[1]}:\"");
 }
 
 test "fish: completes files, directories, and executables from metadata" {

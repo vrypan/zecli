@@ -352,7 +352,10 @@ pub fn generateBash(writer: anytype, app: cli.ApplicationSpec) !void {
 
 fn writeBashHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
     // Candidate lists are filtered without expansion so that values containing
-    // $, backslashes, quotes, or spaces survive intact.
+    // $, backslashes, quotes, or spaces survive intact. The path helpers turn
+    // on `filenames` for their own completion only, so bash escapes spaces and
+    // marks directories; setting it on the `complete` registration instead
+    // would also mangle ordinary candidates that contain a slash.
     try writeHelperPrefix(writer, app);
     try writer.writeAll(
         \\_words() {
@@ -373,6 +376,7 @@ fn writeBashHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
     try writer.writeAll(
         \\_files() {
         \\    COMPREPLY=()
+        \\    compopt -o filenames 2>/dev/null
         \\    while IFS= read -r word; do
         \\        [ -n "$word" ] && COMPREPLY+=("$word")
         \\    done <<< "$(compgen -f -- "$cur")"
@@ -385,6 +389,7 @@ fn writeBashHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
     try writer.writeAll(
         \\_dirs() {
         \\    COMPREPLY=()
+        \\    compopt -o filenames 2>/dev/null
         \\    while IFS= read -r word; do
         \\        [ -n "$word" ] && COMPREPLY+=("$word")
         \\    done <<< "$(compgen -d -- "$cur")"
@@ -744,9 +749,12 @@ pub fn generateZsh(writer: anytype, app: cli.ApplicationSpec) !void {
         \\            _describe -t commands 'command' commands && return 0
         \\            ;;
         \\        args)
-        \\            case ${words[1]} in
-        \\
+        \\            curcontext="${curcontext%:*:*}:
     );
+    // Narrow the context to the subcommand so per-command zstyles apply.
+    try writer.writeAll(app.name);
+    try writer.writeAll("-${words[1]}:\"\n            case ${words[1]} in\n");
+
     for (app.commands) |command| {
         try writer.writeAll("                ");
         try writeBashCommandPattern(writer, command);
@@ -1183,7 +1191,10 @@ fn writeFishFlag(
     try writeFishCondition(writer, app, command, true);
     try writer.print(" -l {s}", .{flag.name});
     if (flag.short) |short| try writer.print(" -s {c}", .{short});
-    if (cli.takesValue(flag)) try writer.writeAll(" -r");
+    // -x, not -r: `require-parameter` still lets fish fall back to filenames
+    // alongside the declared values, so a directory-only flag would offer
+    // regular files. `exclusive` matches how bash and zsh complete values.
+    if (cli.takesValue(flag)) try writer.writeAll(" -x");
     if (flag.description.len > 0) {
         try writer.writeAll(" -d ");
         try writeFishQuoted(writer, flag.description);
@@ -1201,7 +1212,7 @@ fn writeFishFlag(
         try writeFishQuoted(writer, app.name);
         try writeFishCondition(writer, app, command, true);
         try writer.print(" -l {s}", .{alias});
-        if (cli.takesValue(flag)) try writer.writeAll(" -r");
+        if (cli.takesValue(flag)) try writer.writeAll(" -x");
         if (flag.description.len > 0) {
             try writer.writeAll(" -d ");
             try writeFishQuoted(writer, flag.description);

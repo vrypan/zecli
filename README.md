@@ -130,6 +130,12 @@ A duplicate command name then fails the build with
 Every field must be comptime-known; a specification assembled at runtime calls
 `validateApplicationSpec` directly instead.
 
+Validation compares every pair of names in a scope, so it can exceed Zig's
+default limit of 1000 backwards branches. `comptimeValidated` raises the limit
+to a bound computed from the specification, so no call site needs
+`@setEvalBranchQuota`. Because `@setEvalBranchQuota` only ever raises the
+limit, a caller that has already asked for more keeps it.
+
 ## Parsing
 
 ```zig

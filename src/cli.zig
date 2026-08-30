@@ -292,11 +292,53 @@ pub fn validateCommandSpec(spec: CommandSpec) SpecError!void {
 /// use `validateApplicationSpec` instead.
 pub fn comptimeValidated(comptime application: ApplicationSpec) ApplicationSpec {
     comptime {
+        // Validation compares every pair of names in a scope, so its cost grows
+        // with the square of the specification, and the default 1000 backwards
+        // branches runs out on a real application. Raise the limit enough to
+        // walk the specification, then to the bound the comparisons need.
+        // @setEvalBranchQuota only ever raises, so a caller that already asked
+        // for more keeps it.
+        @setEvalBranchQuota(walk_branch_quota);
+        @setEvalBranchQuota(validationBranchQuota(application));
         validateApplicationSpec(application) catch |err| @compileError(
             "invalid ApplicationSpec '" ++ application.name ++ "': " ++ @errorName(err),
         );
     }
     return application;
+}
+
+/// Enough branches to walk any realistic specification and count its names,
+/// which `validationBranchQuota` has to do before it can size the real quota.
+const walk_branch_quota = 100_000;
+
+/// Branches per name comparison: each one walks two names and, for an option,
+/// its aliases. Deliberately generous, since the quota only caps compile-time
+/// evaluation and costs nothing when it is not reached.
+const branches_per_comparison = 64;
+
+/// An upper bound on the branches `validateApplicationSpec` needs, from the
+/// number of name pairs it compares.
+fn validationBranchQuota(comptime application: ApplicationSpec) usize {
+    var pairs = scopeNameCount(application.flags);
+    pairs *= pairs;
+
+    var command_names: usize = 0;
+    for (application.commands) |command| {
+        command_names += 1 + command.aliases.len;
+        const flag_names = scopeNameCount(command.flags);
+        pairs += flag_names * flag_names;
+        pairs += command.arguments.len * command.arguments.len;
+    }
+    pairs += command_names * command_names;
+
+    return walk_branch_quota + branches_per_comparison * pairs;
+}
+
+/// Every spelling an option in this scope can be written as.
+fn scopeNameCount(flags: []const FlagSpec) usize {
+    var count: usize = 0;
+    for (flags) |flag| count += 1 + flag.aliases.len;
+    return count;
 }
 
 pub fn validateApplicationSpec(application: ApplicationSpec) SpecError!void {

@@ -1080,6 +1080,55 @@ test "comptimeValidated returns the specification unchanged" {
     try testing.expectEqual(demo_app.commands.len, application.commands.len);
 }
 
+/// A specification far larger than the demo one, built at compile time, to
+/// keep `comptimeValidated` inside Zig's evaluation limits for a real
+/// application. Validation compares every pair of names in a scope, so the
+/// work grows with the square of this.
+const large_app = blk: {
+    // This quota is for building the fixture's names with comptimePrint, not
+    // for validating it: comptimeValidated raises its own.
+    @setEvalBranchQuota(500_000);
+
+    const command_count = 24;
+    const flags_per_command = 10;
+
+    var commands: [command_count]cli.CommandSpec = undefined;
+    for (&commands, 0..) |*command, i| {
+        var flags: [flags_per_command]cli.FlagSpec = undefined;
+        for (&flags, 0..) |*flag, j| {
+            flag.* = .{
+                .name = std.fmt.comptimePrint("option-{d}-{d}", .{ i, j }),
+                .aliases = &.{std.fmt.comptimePrint("alias-{d}-{d}", .{ i, j })},
+                .value = .string,
+                .description = "An option",
+            };
+        }
+        const frozen = flags;
+        command.* = .{
+            .name = std.fmt.comptimePrint("command-{d}", .{i}),
+            .aliases = &.{std.fmt.comptimePrint("c{d}", .{i})},
+            .description = "A command",
+            .usage = std.fmt.comptimePrint("large command-{d}", .{i}),
+            .flags = &frozen,
+        };
+    }
+    const frozen_commands = commands;
+    break :blk cli.comptimeValidated(.{
+        .name = "large",
+        .description = "A large application.",
+        .usage = "large [options] <command>",
+        .commands = &frozen_commands,
+    });
+};
+
+test "comptimeValidated handles a specification with many commands and options" {
+    // Reaching this at all means the compile-time validation stayed inside the
+    // branch quota; the assertions just pin the shape.
+    try testing.expectEqual(@as(usize, 24), large_app.commands.len);
+    try testing.expectEqual(@as(usize, 10), large_app.commands[0].flags.len);
+    try testing.expect(cli.findCommand(large_app, "c23") != null);
+}
+
 test "printCommandHelp: shows option aliases, choices, and defaults" {
     var buffer = Buffer.init(testing.allocator);
     defer buffer.deinit();

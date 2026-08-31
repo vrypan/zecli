@@ -124,7 +124,9 @@ matching environment variable. For example, `--first-name` reads
 `MY_APP_FIRST_NAME`. Command-line values take precedence over environment
 values, which take precedence over defaults. No-value switches read boolean
 environment values, so `MY_APP_SHOUT=true` enables `--shout` when the option is
-omitted.
+omitted. Repeatable options read comma-separated environment values, so
+`MY_APP_TAG=fruit,asia` is equivalent to `--tag fruit --tag asia` when `--tag`
+is omitted.
 
 For raw access, checked conversions, repeatable values, and the parsed-result
 layout, see [Value Resolution](docs/value-resolution.md).

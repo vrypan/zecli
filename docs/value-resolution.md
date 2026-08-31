@@ -92,8 +92,18 @@ while (items.next()) |item| {
 ```
 
 Values are yielded in command-line order. When a repeatable option is omitted
-and has an environment value or default, the iterator yields that fallback once.
-Explicit values take precedence over environment values and defaults.
+and has an environment value, zecli splits that value on commas and yields each
+item after trimming ASCII whitespace. A repeatable option's default is yielded
+once. Explicit values take precedence over environment values and defaults.
+
+```text
+--tag fruit --tag asia    -> fruit, then asia
+MY_APP_TAG=fruit,asia     -> fruit, then asia when --tag is omitted
+MY_APP_TAG=fruit, asia    -> fruit, then asia when --tag is omitted
+```
+
+Comma escaping is not supported yet, and empty items are invalid. A
+non-repeatable environment value is never split, even if it contains commas.
 
 ## Raw result access
 

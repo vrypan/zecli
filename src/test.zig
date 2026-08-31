@@ -833,6 +833,134 @@ test "Invocation: reports invalid boolean environment values for no-value switch
     try testing.expect(std.mem.indexOf(u8, buffer.bytes.items, "invalid environment value for '--verbose'") != null);
 }
 
+test "Invocation: resolves repeatable environment values by comma" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_TAG", "fruit, asia,europe");
+    try environ.put("MY_APP_COUNT", "1, 2,3");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{
+                .{ .name = "tag", .value = .string, .repeatable = true },
+                .{ .name = "count", .value = .int, .repeatable = true },
+            },
+        }},
+    };
+    var invocation = try cli.Invocation.init(allocator, nw, application, &.{"greet"}, &environ);
+    defer invocation.deinit(allocator);
+    const command = invocation.getCommand().?;
+
+    var tags = command.getValues([]const u8, "tag");
+    try testing.expectEqualStrings("fruit", tags.next().?);
+    try testing.expectEqualStrings("asia", tags.next().?);
+    try testing.expectEqualStrings("europe", tags.next().?);
+    try testing.expect(tags.next() == null);
+
+    var counts = command.getValues(usize, "count");
+    try testing.expectEqual(@as(usize, 1), counts.next().?);
+    try testing.expectEqual(@as(usize, 2), counts.next().?);
+    try testing.expectEqual(@as(usize, 3), counts.next().?);
+    try testing.expect(counts.next() == null);
+}
+
+test "Invocation: command-line repeatable values override environment values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_TAG", "fruit,asia");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "tag", .value = .string, .repeatable = true }},
+        }},
+    };
+    var invocation = try cli.Invocation.init(allocator, nw, application, &.{ "greet", "--tag", "europe", "--tag=africa" }, &environ);
+    defer invocation.deinit(allocator);
+    const command = invocation.getCommand().?;
+
+    var tags = command.getValues([]const u8, "tag");
+    try testing.expectEqualStrings("europe", tags.next().?);
+    try testing.expectEqualStrings("africa", tags.next().?);
+    try testing.expect(tags.next() == null);
+}
+
+test "Invocation: non-repeatable environment values are not comma split" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_NAME", "Ada,Grace");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "name", .value = .string }},
+        }},
+    };
+    var invocation = try cli.Invocation.init(allocator, nw, application, &.{"greet"}, &environ);
+    defer invocation.deinit(allocator);
+
+    try testing.expectEqualStrings("Ada,Grace", invocation.getCommand().?.getValue([]const u8, "name").?);
+}
+
+test "Invocation: rejects empty repeatable environment values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_TAG", "fruit,,asia");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "tag", .value = .string, .repeatable = true }},
+        }},
+    };
+    var buffer = Buffer.init(allocator);
+    defer buffer.deinit();
+
+    try testing.expectError(error.ReportedCliError, cli.Invocation.init(allocator, &buffer, application, &.{"greet"}, &environ));
+    try testing.expect(std.mem.indexOf(u8, buffer.bytes.items, "invalid environment value for '--tag'") != null);
+}
+
 test "Invocation: parses root and command scopes" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

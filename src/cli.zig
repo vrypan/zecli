@@ -880,30 +880,58 @@ fn appendEnvironment(
         }
 
         const raw = environ.get(name.items) orelse continue;
-        const parsed_value = decodeEnvironmentValue(spec, raw) catch {
-            setDiagnostic(diagnostic, .{
-                .issue = .invalid_environment_value,
-                .flag_name = spec.name,
-                .value = raw,
-            });
-            return error.InvalidArgument;
-        };
-        if (spec.choices.len > 0 and !containsString(spec.choices, raw)) {
-            setDiagnostic(diagnostic, .{
-                .issue = .invalid_environment_value,
-                .flag_name = spec.name,
-                .value = raw,
-            });
-            return error.InvalidArgument;
+        if (spec.repeatable) {
+            var items = std.mem.splitScalar(u8, raw, ',');
+            while (items.next()) |item| {
+                const value = std.mem.trim(u8, item, " \t\r\n");
+                try appendEnvironmentValue(allocator, parsed, spec, value, raw, diagnostic);
+            }
+        } else {
+            try appendEnvironmentValue(allocator, parsed, spec, raw, raw, diagnostic);
         }
-
-        try parsed.flags.append(allocator, .{
-            .name = spec.name,
-            .value = raw,
-            .parsed_value = parsed_value,
-            .source = .environment,
-        });
     }
+}
+
+fn appendEnvironmentValue(
+    allocator: Allocator,
+    parsed: *Parsed,
+    spec: FlagSpec,
+    value: []const u8,
+    raw: []const u8,
+    diagnostic: ?*ParseDiagnostic,
+) !void {
+    if (value.len == 0) {
+        setDiagnostic(diagnostic, .{
+            .issue = .invalid_environment_value,
+            .flag_name = spec.name,
+            .value = raw,
+        });
+        return error.InvalidArgument;
+    }
+
+    const parsed_value = decodeEnvironmentValue(spec, value) catch {
+        setDiagnostic(diagnostic, .{
+            .issue = .invalid_environment_value,
+            .flag_name = spec.name,
+            .value = raw,
+        });
+        return error.InvalidArgument;
+    };
+    if (spec.choices.len > 0 and !containsString(spec.choices, value)) {
+        setDiagnostic(diagnostic, .{
+            .issue = .invalid_environment_value,
+            .flag_name = spec.name,
+            .value = raw,
+        });
+        return error.InvalidArgument;
+    }
+
+    try parsed.flags.append(allocator, .{
+        .name = spec.name,
+        .value = value,
+        .parsed_value = parsed_value,
+        .source = .environment,
+    });
 }
 
 fn decodeEnvironmentValue(spec: FlagSpec, raw: []const u8) !ParsedValue {

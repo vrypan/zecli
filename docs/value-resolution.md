@@ -1,14 +1,16 @@
 # Value Resolution
 
-`Parsed.getValue` is the normal way to read an option value. It returns the
-final effective value in the type declared by `FlagSpec.value`.
+`Invocation.getValue` reads root option values and `Command.getValue` reads
+selected-command option values. Both return the final effective value in the
+type declared by `FlagSpec.value`. `Parsed.getValue` provides the same
+low-level operation.
 
 ```zig
-const name = parsed.getValue([]const u8, "name").?;
-const times = parsed.getValue(usize, "times").?;
-const offset = parsed.getValue(i64, "offset").?;
-const ratio = parsed.getValue(f64, "ratio").?;
-const enabled = parsed.getValue(bool, "enabled").?;
+const name = invocation.getValue([]const u8, "name").?;
+const times = command.getValue(usize, "times").?;
+const offset = command.getValue(i64, "offset").?;
+const ratio = command.getValue(f64, "ratio").?;
+const enabled = command.getValue(bool, "enabled").?;
 ```
 
 `getValue` returns `null` when the option has no effective value, or when the
@@ -49,7 +51,7 @@ values, and environment values follow that same validation. For example, an
 `.int` value must be a valid `usize`, and a `.float` value must be a valid
 `f64`.
 
-`parseInvocation` applies this same resolution to application/root flags before
+`Invocation.init` applies this same resolution to application/root flags before
 parsing the selected command. Its v1 grammar accepts root options only before
 the command.
 
@@ -85,6 +87,12 @@ Explicit values take precedence over environment values and defaults.
 
 ## Raw result access
 
+`Command.positionals()` returns positional arguments before `--`.
+`Command.passthrough()` returns an optional slice containing literal arguments
+after the separator. The separator is absent when the result is `null`; a
+trailing separator produces a non-null empty slice. Positional validation never
+includes pass-through arguments.
+
 `Parsed.last(name)` returns the final raw string value, regardless of declared
 value type. It is useful for pass-through commands and consumers that require
 the original spelling.
@@ -92,6 +100,8 @@ the original spelling.
 `Parsed.flags.items` contains every explicit occurrence for repeatable flags,
 plus one default entry for each omitted option with a default. Each entry is a
 `FlagValue` with its canonical name, raw value, parsed value, and source.
+`Parsed.passthrough` and `Parsed.has_passthrough` expose the same separator
+state at the lower level.
 
 All strings borrow from `argv` or the static specification; `Parsed.deinit`
 only releases its internal arrays.

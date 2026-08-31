@@ -151,6 +151,8 @@ const application = cli.comptimeValidated(.{
     .commands = &commands,
 });
 
+const CommandName = cli.CommandEnum(application);
+
 // Candidates the external completer offers, including one containing a space
 // to show that a candidate is never split.
 const demo_references = [_][]const u8{ "@1/out", "@2/out", "@42/out", "note with space" };
@@ -180,50 +182,38 @@ fn run(
     args: []const [:0]const u8,
     environ: *const std.process.Environ.Map,
 ) !u8 {
-    if (args.len <= 1 or cli.helpRequested(args[1..2])) {
-        try cli.printApplicationHelp(allocator, stdout, application);
-        return 0;
-    }
-    if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-V")) {
+    var invocation = try cli.Invocation.init(allocator, stderr, application, args[1..], environ);
+    defer invocation.deinit(allocator);
+
+    if (try invocation.printHelpIfRequested(allocator, stdout)) return 0;
+    if (invocation.present("version")) {
         try stdout.writeAll("zecli-example 0.2.0\n");
         return 0;
     }
 
-    if (args.len > 2) {
-        if (cli.findCommand(application, args[1])) |command| {
-            if (cli.helpRequested(args[2..])) {
-                try cli.printCommandHelp(allocator, stdout, command);
-                return 0;
-            }
-        }
-    }
-
-    var invocation = try cli.parseInvocation(allocator, stderr, args[1..], application, environ);
-    defer invocation.deinit(allocator);
-
-    // Canonical lookup resolves aliases; dispatch stays the caller's job.
-    const command = invocation.command orelse {
-        try stderr.print("error: unknown command '{s}'\n\n", .{invocation.command_token orelse ""});
-        try cli.printApplicationHelp(allocator, stderr, application);
-        return 1;
+    const command = invocation.getCommand() orelse {
+        try cli.printApplicationHelp(allocator, stdout, application);
+        return 0;
     };
 
-    if (std.mem.eql(u8, command.spec.name, "greet")) return runGreet(stdout, &command.parsed);
-    if (std.mem.eql(u8, command.spec.name, "cat")) return runCat(stdout, &command.parsed);
-    if (std.mem.eql(u8, command.spec.name, "complete")) return runComplete(stdout, &command.parsed);
-    return runCompletion(stdout, stderr, &command.parsed);
+    switch (try command.as(CommandName)) {
+        .greet => return runGreet(stdout, command),
+        .cat => return runCat(stdout, command),
+        .complete => return runComplete(stdout, command),
+        .completion => return runCompletion(stdout, stderr, command),
+    }
 }
 
 fn runGreet(
     stdout: anytype,
-    parsed: *const cli.Parsed,
+    command: *const cli.Command,
 ) !u8 {
     // --colour always is recorded under the canonical name "color".
-    const color = parsed.getValue([]const u8, "color").?;
-    const shout = parsed.present("shout") or std.mem.eql(u8, color, "always");
+    const color = command.getValue([]const u8, "color").?;
+    const shout = command.present("shout") or std.mem.eql(u8, color, "always");
 
-    const name = parsed.getValue([]const u8, "name").?;
-    const times = parsed.getValue(usize, "times").?;
+    const name = command.getValue([]const u8, "name").?;
+    const times = command.getValue(usize, "times").?;
 
     var i: usize = 0;
     while (i < times) : (i += 1) {
@@ -240,18 +230,19 @@ fn runGreet(
 
 fn runCat(
     stdout: anytype,
-    parsed: *const cli.Parsed,
+    command: *const cli.Command,
 ) !u8 {
-    if (parsed.getValue([]const u8, "ref")) |ref| try stdout.print("ref: {s}\n", .{ref});
-    for (parsed.positionals.items) |path| try stdout.print("file: {s}\n", .{path});
+    if (command.getValue([]const u8, "ref")) |ref| try stdout.print("ref: {s}\n", .{ref});
+    for (command.positionals()) |path| try stdout.print("file: {s}\n", .{path});
     return 0;
 }
 
 fn runComplete(
     stdout: anytype,
-    parsed: *const cli.Parsed,
+    command: *const cli.Command,
 ) !u8 {
-    const prefix = if (parsed.positionals.items.len > 0) parsed.positionals.items[0] else "";
+    const positionals = command.positionals();
+    const prefix = if (positionals.len > 0) positionals[0] else "";
 
     // One candidate per line on stdout is the whole external-completer contract.
     for (demo_references) |reference| {
@@ -265,9 +256,9 @@ fn runComplete(
 fn runCompletion(
     stdout: anytype,
     stderr: anytype,
-    parsed: *const cli.Parsed,
+    command: *const cli.Command,
 ) !u8 {
-    const shell = parsed.positionals.items[0];
+    const shell = command.positionals()[0];
 
     if (std.mem.eql(u8, shell, "bash")) {
         try completion.generateBash(stdout, application);

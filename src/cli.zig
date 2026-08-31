@@ -60,8 +60,6 @@ pub const CommandSpec = struct {
     flags: []const FlagSpec = &.{},
     arguments: []const ArgumentSpec = &.{},
     extra_help: ?[]const u8 = null,
-    /// Set by `findCommand` from the containing application's `prefix`.
-    environment_prefix: ?[]const u8 = null,
 };
 
 pub const ApplicationSpec = struct {
@@ -118,12 +116,15 @@ pub const GetValueAsError = error{
 pub const Parsed = struct {
     flags: std.ArrayList(FlagValue) = .empty,
     positionals: std.ArrayList([]const u8) = .empty,
+    passthrough: std.ArrayList([:0]const u8) = .empty,
+    has_passthrough: bool = false,
 
-    /// Releases the two buffers. Flag names and values are borrowed from argv,
+    /// Releases internal buffers. Flag names and values are borrowed from argv,
     /// the environment map, and the specification, so they are not freed.
     pub fn deinit(self: *Parsed, allocator: Allocator) void {
         self.flags.deinit(allocator);
         self.positionals.deinit(allocator);
+        self.passthrough.deinit(allocator);
         self.* = .{};
     }
 
@@ -178,22 +179,111 @@ pub const Parsed = struct {
     }
 };
 
-pub const ParsedInvocation = struct {
-    pub const Command = struct {
-        spec: CommandSpec,
-        parsed: Parsed,
-    };
+pub const Command = struct {
+    name: []const u8,
+    spec: CommandSpec,
+    parsed: Parsed,
 
-    root: Parsed = .{},
-    command: ?Command = null,
-    command_token: ?[]const u8 = null,
+    pub fn present(self: *const Command, option: []const u8) bool {
+        return self.parsed.present(option);
+    }
 
-    pub fn deinit(self: *ParsedInvocation, allocator: Allocator) void {
-        self.root.deinit(allocator);
-        if (self.command) |*command| command.parsed.deinit(allocator);
-        self.* = .{};
+    pub fn getValue(self: *const Command, comptime T: type, option: []const u8) ?T {
+        return self.parsed.getValue(T, option);
+    }
+
+    pub fn getValues(self: *const Command, comptime T: type, option: []const u8) ValueIterator(T) {
+        return self.parsed.getValues(T, option);
+    }
+
+    pub fn positionals(self: *const Command) []const []const u8 {
+        return self.parsed.positionals.items;
+    }
+
+    /// Returns the literal arguments after `--`, or null when no separator was
+    /// supplied. A trailing `--` returns a non-null empty slice.
+    pub fn passthrough(self: *const Command) ?[]const [:0]const u8 {
+        if (!self.parsed.has_passthrough) return null;
+        return self.parsed.passthrough.items;
+    }
+
+    pub fn as(self: *const Command, comptime E: type) !E {
+        return std.meta.stringToEnum(E, self.name) orelse error.UnknownCommandTag;
     }
 };
+
+pub const Invocation = struct {
+    application: ApplicationSpec,
+    root: Parsed = .{},
+    command: ?Command = null,
+    help_target: HelpTarget = .none,
+
+    const HelpTarget = enum {
+        none,
+        application,
+        command,
+    };
+
+    pub fn init(
+        allocator: Allocator,
+        writer: anytype,
+        application: ApplicationSpec,
+        args: []const [:0]const u8,
+        environ: *const std.process.Environ.Map,
+    ) !Invocation {
+        return initInvocation(allocator, writer, application, args, environ);
+    }
+
+    pub fn deinit(self: *Invocation, allocator: Allocator) void {
+        const application = self.application;
+        self.root.deinit(allocator);
+        if (self.command) |*command| command.parsed.deinit(allocator);
+        self.* = .{ .application = application };
+    }
+
+    pub fn present(self: *const Invocation, option: []const u8) bool {
+        return self.root.present(option);
+    }
+
+    pub fn getValue(self: *const Invocation, comptime T: type, option: []const u8) ?T {
+        return self.root.getValue(T, option);
+    }
+
+    pub fn getValues(self: *const Invocation, comptime T: type, option: []const u8) ValueIterator(T) {
+        return self.root.getValues(T, option);
+    }
+
+    pub fn getCommand(self: *const Invocation) ?*const Command {
+        if (self.command) |*command| return command;
+        return null;
+    }
+
+    pub fn printHelpIfRequested(self: *const Invocation, allocator: Allocator, writer: anytype) !bool {
+        switch (self.help_target) {
+            .none => return false,
+            .application => try printApplicationHelp(allocator, writer, self.application),
+            .command => try printCommandHelp(allocator, writer, self.command.?.spec),
+        }
+        return true;
+    }
+};
+
+/// Generates an enum whose tags are the application's canonical command names.
+pub fn CommandEnum(comptime application: ApplicationSpec) type {
+    const names = comptime blk: {
+        var result: [application.commands.len][]const u8 = undefined;
+        for (application.commands, 0..) |command, i| {
+            result[i] = command.name;
+        }
+        break :blk result;
+    };
+    const values = comptime blk: {
+        var result: [application.commands.len]u32 = undefined;
+        for (&result, 0..) |*value, i| value.* = @intCast(i);
+        break :blk result;
+    };
+    return @Enum(u32, .exhaustive, &names, &values);
+}
 
 pub fn ValueIterator(comptime T: type) type {
     return struct {
@@ -251,18 +341,12 @@ fn convertValue(comptime T: type, flag: FlagValue) GetValueAsError!T {
 /// canonical specification.
 pub fn findCommand(application: ApplicationSpec, token: []const u8) ?CommandSpec {
     for (application.commands) |command| {
-        if (std.mem.eql(u8, command.name, token)) return resolvedCommand(application, command);
+        if (std.mem.eql(u8, command.name, token)) return command;
         for (command.aliases) |alias| {
-            if (std.mem.eql(u8, alias, token)) return resolvedCommand(application, command);
+            if (std.mem.eql(u8, alias, token)) return command;
         }
     }
     return null;
-}
-
-fn resolvedCommand(application: ApplicationSpec, command: CommandSpec) CommandSpec {
-    var result = command;
-    result.environment_prefix = application.prefix;
-    return result;
 }
 
 /// Resolves a long option name, which may be a canonical name or an alias, to
@@ -365,7 +449,7 @@ fn validateFlags(flags: []const FlagSpec) SpecError!void {
         }
 
         if (flag.default_value) |value| {
-            _ = parseDefaultValue(flag, value) catch return error.InvalidDefaultValue;
+            _ = decodeValue(flag, value) catch return error.InvalidDefaultValue;
             if (flag.choices.len > 0) {
                 if (!containsString(flag.choices, value)) return error.DefaultNotInChoices;
             }
@@ -547,34 +631,29 @@ pub fn parseCommand(
     writer: anytype,
     args: []const [:0]const u8,
     spec: CommandSpec,
-    environ: *const std.process.Environ.Map,
 ) !Parsed {
     var diagnostic = ParseDiagnostic{};
-    var parsed = parseInternal(allocator, args, spec.flags, spec.environment_prefix, environ, &diagnostic) catch |err| {
+    var scope = parseScope(allocator, args, spec.flags, .complete, null, null, false, &diagnostic) catch |err| {
         if (err != error.InvalidArgument) return err;
         try printParseError(writer, spec, diagnostic);
         return error.ReportedCliError;
     };
-    errdefer parsed.deinit(allocator);
-    validateArguments(parsed.positionals.items, spec.arguments, &diagnostic) catch |err| {
+    errdefer scope.parsed.deinit(allocator);
+    validateArguments(scope.parsed.positionals.items, spec.arguments, &diagnostic) catch |err| {
         if (err != error.InvalidArgument) return err;
         try printParseError(writer, spec, diagnostic);
         return error.ReportedCliError;
     };
-    return parsed;
+    return scope.parsed;
 }
 
-/// Parses an application invocation with root options before its command.
-/// Root options after the command are not supported by this entry point.
-pub fn parseInvocation(
+fn initInvocation(
     allocator: Allocator,
     writer: anytype,
-    args: []const [:0]const u8,
     application: ApplicationSpec,
+    args: []const [:0]const u8,
     environ: *const std.process.Environ.Map,
-) !ParsedInvocation {
-    const boundary = rootCommandBoundary(application, args);
-    const root_args = args[0..boundary];
+) !Invocation {
     const root_spec = CommandSpec{
         .name = application.name,
         .description = application.description,
@@ -583,66 +662,80 @@ pub fn parseInvocation(
     };
 
     var diagnostic = ParseDiagnostic{};
-    var root = parseInternal(allocator, root_args, application.flags, application.prefix, environ, &diagnostic) catch |err| {
+    var root_scope = parseScope(
+        allocator,
+        args,
+        application.flags,
+        .root,
+        .{ .prefix = application.prefix, .environ = environ },
+        application,
+        true,
+        &diagnostic,
+    ) catch |err| {
         if (err != error.InvalidArgument) return err;
         try printParseError(writer, root_spec, diagnostic);
         return error.ReportedCliError;
     };
-    errdefer root.deinit(allocator);
+    errdefer root_scope.parsed.deinit(allocator);
 
-    if (boundary == args.len) return .{ .root = root };
-
-    const token = args[boundary];
-    const command_spec = findCommand(application, token) orelse {
-        return .{ .root = root, .command_token = token };
-    };
-    const command_parsed = try parseCommand(allocator, writer, args[boundary + 1 ..], command_spec, environ);
-    return .{
-        .root = root,
-        .command = .{ .spec = command_spec, .parsed = command_parsed },
-        .command_token = token,
-    };
-}
-
-fn rootCommandBoundary(application: ApplicationSpec, args: []const [:0]const u8) usize {
-    var i: usize = 0;
-    while (i < args.len) {
-        const arg = args[i];
-        if (arg.len == 0 or arg[0] != '-' or arg.len == 1 or std.mem.eql(u8, arg, "--")) return i;
-
-        if (arg[1] == '-') {
-            const raw = arg[2..];
-            const eql_pos = std.mem.indexOfScalar(u8, raw, '=');
-            const name = if (eql_pos) |pos| raw[0..pos] else raw;
-            const inline_value = eql_pos != null;
-            if (findApplicationFlag(application, name)) |flag| {
-                if (rootFlagConsumesNext(application, flag, inline_value, args, i)) i += 1;
-            }
-        } else if (findShort(application.flags, arg[1])) |flag| {
-            if (rootFlagConsumesNext(application, flag, arg.len > 2, args, i)) i += 1;
-        }
-        i += 1;
+    if (root_scope.help_requested) {
+        return .{
+            .application = application,
+            .root = root_scope.parsed,
+            .help_target = .application,
+        };
     }
-    return i;
-}
 
-fn rootFlagConsumesNext(
-    application: ApplicationSpec,
-    flag: FlagSpec,
-    inline_value: bool,
-    args: []const [:0]const u8,
-    index: usize,
-) bool {
-    if (inline_value or flag.value == .none or index + 1 >= args.len) return false;
-    if (flag.value != .bool_optional) return true;
+    if (root_scope.next_index == args.len) {
+        return .{ .application = application, .root = root_scope.parsed };
+    }
 
-    const next = args[index + 1];
-    if (next.len == 0 or next[0] == '-') return false;
-    return findCommand(application, next) == null;
+    const token = args[root_scope.next_index];
+    const command_spec = findCommand(application, token) orelse {
+        try writer.print("error: unknown command '{s}'\n\n", .{token});
+        try printApplicationHelp(allocator, writer, application);
+        return error.ReportedCliError;
+    };
+
+    var command_scope = parseScope(
+        allocator,
+        args[root_scope.next_index + 1 ..],
+        command_spec.flags,
+        .complete,
+        .{ .prefix = application.prefix, .environ = environ },
+        null,
+        true,
+        &diagnostic,
+    ) catch |err| {
+        if (err != error.InvalidArgument) return err;
+        try printParseError(writer, command_spec, diagnostic);
+        return error.ReportedCliError;
+    };
+    errdefer command_scope.parsed.deinit(allocator);
+
+    if (!command_scope.help_requested) {
+        validateArguments(command_scope.parsed.positionals.items, command_spec.arguments, &diagnostic) catch |err| {
+            if (err != error.InvalidArgument) return err;
+            try printParseError(writer, command_spec, diagnostic);
+            return error.ReportedCliError;
+        };
+    }
+
+    return .{
+        .application = application,
+        .root = root_scope.parsed,
+        .command = .{
+            .name = command_spec.name,
+            .spec = command_spec,
+            .parsed = command_scope.parsed,
+        },
+        .help_target = if (command_scope.help_requested) .command else .none,
+    };
 }
 
 pub fn parse(allocator: Allocator, args: []const [:0]const u8, specs: []const FlagSpec) !Parsed {
-    return parseInternal(allocator, args, specs, null, null, null);
+    const scope = try parseScope(allocator, args, specs, .complete, null, null, false, null);
+    return scope.parsed;
 }
 
 /// Reports whether the caller should print help. Scanning stops at the first
@@ -655,19 +748,35 @@ pub fn helpRequested(args: []const [:0]const u8) bool {
     return false;
 }
 
-fn parseInternal(
+const ScopeMode = enum {
+    complete,
+    root,
+};
+
+const Resolution = struct {
+    prefix: ?[]const u8 = null,
+    environ: ?*const std.process.Environ.Map = null,
+};
+
+const ScopeResult = struct {
+    parsed: Parsed,
+    next_index: usize,
+    help_requested: bool,
+};
+
+fn parseScope(
     allocator: Allocator,
     args: []const [:0]const u8,
     specs: []const FlagSpec,
-    environment_prefix: ?[]const u8,
-    environ: ?*const std.process.Environ.Map,
+    mode: ScopeMode,
+    resolution: ?Resolution,
+    application: ?ApplicationSpec,
+    allow_help: bool,
     diagnostic: ?*ParseDiagnostic,
-) !Parsed {
+) !ScopeResult {
     var parsed = Parsed{};
     errdefer parsed.deinit(allocator);
-    const seen = try allocator.alloc(bool, specs.len);
-    defer allocator.free(seen);
-    @memset(seen, false);
+    var help_requested = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -675,42 +784,51 @@ fn parseInternal(
 
         // Empty args, non-flags, and bare "-" are treated as positionals.
         if (arg.len == 0 or arg[0] != '-' or arg.len == 1) {
+            if (mode == .root) break;
             try parsed.positionals.append(allocator, arg);
             continue;
         }
 
         if (arg[1] == '-') {
             if (arg.len == 2) {
-                // "--" separator: everything after is positional.
-                for (args[i + 1 ..]) |rest| {
-                    try parsed.positionals.append(allocator, rest);
-                }
+                if (mode == .root) break;
+                parsed.has_passthrough = true;
+                try parsed.passthrough.appendSlice(allocator, args[i + 1 ..]);
                 break;
             }
-            try parseLong(allocator, args, &i, specs, seen, &parsed, diagnostic);
+            if (allow_help and std.mem.eql(u8, arg, "--help")) {
+                help_requested = true;
+                continue;
+            }
+            try parseLong(allocator, args, &i, specs, application, &parsed, diagnostic);
         } else {
-            try parseShort(allocator, args, &i, specs, seen, &parsed, diagnostic);
+            if (allow_help and std.mem.eql(u8, arg, "-h")) {
+                help_requested = true;
+                continue;
+            }
+            try parseShort(allocator, args, &i, specs, application, &parsed, diagnostic);
         }
     }
-    if (environment_prefix) |prefix| {
-        try appendEnvironment(allocator, &parsed, specs, seen, prefix, environ.?, diagnostic);
+    if (resolution) |value| {
+        if (value.prefix) |prefix| {
+            try appendEnvironment(allocator, &parsed, specs, prefix, value.environ.?, diagnostic);
+        }
     }
-    try appendDefaults(allocator, &parsed, specs, seen);
-    return parsed;
+    try appendDefaults(allocator, &parsed, specs);
+    return .{ .parsed = parsed, .next_index = i, .help_requested = help_requested };
 }
 
-fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec, seen: []bool) !void {
-    for (specs, 0..) |spec, i| {
+fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec) !void {
+    for (specs) |spec| {
         const value = spec.default_value orelse continue;
-        if (seen[i]) continue;
-        const parsed_value = try parseDefaultValue(spec, value);
+        if (hasFlag(parsed, spec.name)) continue;
+        const parsed_value = try decodeValue(spec, value);
         try parsed.flags.append(allocator, .{
             .name = spec.name,
             .value = value,
             .parsed_value = parsed_value,
             .source = .default,
         });
-        seen[i] = true;
     }
 }
 
@@ -718,13 +836,12 @@ fn appendEnvironment(
     allocator: Allocator,
     parsed: *Parsed,
     specs: []const FlagSpec,
-    seen: []bool,
     prefix: []const u8,
     environ: *const std.process.Environ.Map,
     diagnostic: ?*ParseDiagnostic,
 ) !void {
-    for (specs, 0..) |spec, i| {
-        if (seen[i] or !takesValue(spec)) continue;
+    for (specs) |spec| {
+        if (hasFlag(parsed, spec.name) or !takesValue(spec)) continue;
 
         var fallback = std.heap.stackFallback(128, allocator);
         const name_allocator = fallback.get();
@@ -737,7 +854,7 @@ fn appendEnvironment(
         }
 
         const raw = environ.get(name.items) orelse continue;
-        const parsed_value = parseDefaultValue(spec, raw) catch {
+        const parsed_value = decodeValue(spec, raw) catch {
             setDiagnostic(diagnostic, .{
                 .issue = .invalid_environment_value,
                 .flag_name = spec.name,
@@ -760,7 +877,6 @@ fn appendEnvironment(
             .parsed_value = parsed_value,
             .source = .environment,
         });
-        seen[i] = true;
     }
 }
 
@@ -769,7 +885,7 @@ fn parseLong(
     args: []const [:0]const u8,
     index: *usize,
     specs: []const FlagSpec,
-    seen: []bool,
+    application: ?ApplicationSpec,
     parsed: *Parsed,
     diagnostic: ?*ParseDiagnostic,
 ) !void {
@@ -785,8 +901,8 @@ fn parseLong(
     };
     const spec = specs[spec_index];
 
-    const value = try consumeValue(args, index, spec, inline_value, arg, diagnostic);
-    try appendFlag(allocator, parsed, spec, spec_index, seen, value);
+    const value = try consumeValue(args, index, spec, inline_value, arg, application, diagnostic);
+    try appendFlag(allocator, parsed, spec, value);
 }
 
 fn parseShort(
@@ -794,7 +910,7 @@ fn parseShort(
     args: []const [:0]const u8,
     index: *usize,
     specs: []const FlagSpec,
-    seen: []bool,
+    application: ?ApplicationSpec,
     parsed: *Parsed,
     diagnostic: ?*ParseDiagnostic,
 ) !void {
@@ -824,8 +940,8 @@ fn parseShort(
         break :blk body[1..];
     } else null;
 
-    const value = try consumeValue(args, index, spec, inline_value, arg, diagnostic);
-    try appendFlag(allocator, parsed, spec, spec_index, seen, value);
+    const value = try consumeValue(args, index, spec, inline_value, arg, application, diagnostic);
+    try appendFlag(allocator, parsed, spec, value);
 }
 
 const ConsumedValue = struct {
@@ -839,6 +955,7 @@ fn consumeValue(
     spec: FlagSpec,
     inline_value: ?[]const u8,
     token: []const u8,
+    application: ?ApplicationSpec,
     diagnostic: ?*ParseDiagnostic,
 ) !ConsumedValue {
     switch (spec.value) {
@@ -868,74 +985,16 @@ fn consumeValue(
                 break :blk args[index.*];
             };
 
-            if (spec.value == .int) {
-                const value = std.fmt.parseInt(usize, raw, 10) catch {
-                    setDiagnostic(diagnostic, .{
-                        .issue = .invalid_int,
-                        .token = token,
-                        .flag_name = spec.name,
-                        .value = raw,
-                        .expected = getValueName(spec),
-                    });
-                    return error.InvalidArgument;
-                };
-                try checkChoices(spec, raw, token, diagnostic);
-                return .{ .raw = raw, .parsed = .{ .int = value } };
-            }
-
-            if (spec.value == .signed_int) {
-                const value = std.fmt.parseInt(i64, raw, 10) catch {
-                    setDiagnostic(diagnostic, .{
-                        .issue = .invalid_int,
-                        .token = token,
-                        .flag_name = spec.name,
-                        .value = raw,
-                        .expected = getValueName(spec),
-                    });
-                    return error.InvalidArgument;
-                };
-                try checkChoices(spec, raw, token, diagnostic);
-                return .{ .raw = raw, .parsed = .{ .signed_int = value } };
-            }
-
-            if (spec.value == .float) {
-                const value = std.fmt.parseFloat(f64, raw) catch {
-                    setDiagnostic(diagnostic, .{
-                        .issue = .invalid_float,
-                        .token = token,
-                        .flag_name = spec.name,
-                        .value = raw,
-                        .expected = getValueName(spec),
-                    });
-                    return error.InvalidArgument;
-                };
-                try checkChoices(spec, raw, token, diagnostic);
-                return .{ .raw = raw, .parsed = .{ .float = value } };
-            }
-
-            if (spec.value == .bool_required) {
-                const value = parseBool(raw) catch {
-                    setDiagnostic(diagnostic, .{
-                        .issue = .invalid_bool,
-                        .token = token,
-                        .flag_name = spec.name,
-                        .value = raw,
-                        .expected = getValueName(spec),
-                    });
-                    return error.InvalidArgument;
-                };
-                try checkChoices(spec, raw, token, diagnostic);
-                return .{ .raw = raw, .parsed = .{ .bool = value } };
-            }
-
-            try checkChoices(spec, raw, token, diagnostic);
-            return .{ .raw = raw, .parsed = .{ .string = raw } };
+            return .{ .raw = raw, .parsed = try decodeCommandLineValue(spec, raw, token, diagnostic) };
         },
         .bool_optional => {
             const raw = inline_value orelse blk: {
                 if (index.* + 1 < args.len) {
                     const next = args[index.* + 1];
                     if (next.len == 0 or next[0] != '-') {
+                        if (application) |app| {
+                            if (findCommand(app, next) != null) break :blk "true";
+                        }
                         index.* += 1;
                         break :blk next;
                     }
@@ -943,24 +1002,37 @@ fn consumeValue(
                 break :blk "true";
             };
 
-            const value = parseBool(raw) catch {
-                setDiagnostic(diagnostic, .{
-                    .issue = .invalid_bool,
-                    .token = token,
-                    .flag_name = spec.name,
-                    .value = raw,
-                    .expected = getValueName(spec),
-                });
-                return error.InvalidArgument;
-            };
-
-            try checkChoices(spec, raw, token, diagnostic);
-            return .{ .raw = raw, .parsed = .{ .bool = value } };
+            return .{ .raw = raw, .parsed = try decodeCommandLineValue(spec, raw, token, diagnostic) };
         },
     }
 }
 
-fn parseDefaultValue(spec: FlagSpec, raw: []const u8) !ParsedValue {
+fn decodeCommandLineValue(
+    spec: FlagSpec,
+    raw: []const u8,
+    token: []const u8,
+    diagnostic: ?*ParseDiagnostic,
+) !ParsedValue {
+    const value = decodeValue(spec, raw) catch {
+        setDiagnostic(diagnostic, .{
+            .issue = switch (spec.value) {
+                .int, .signed_int => .invalid_int,
+                .float => .invalid_float,
+                .bool_required, .bool_optional => .invalid_bool,
+                else => .invalid_choice,
+            },
+            .token = token,
+            .flag_name = spec.name,
+            .value = raw,
+            .expected = getValueName(spec),
+        });
+        return error.InvalidArgument;
+    };
+    try checkChoices(spec, raw, token, diagnostic);
+    return value;
+}
+
+fn decodeValue(spec: FlagSpec, raw: []const u8) !ParsedValue {
     return switch (spec.value) {
         .none => error.InvalidArgument,
         .string => .{ .string = raw },
@@ -993,8 +1065,6 @@ fn appendFlag(
     allocator: Allocator,
     parsed: *Parsed,
     spec: FlagSpec,
-    spec_index: usize,
-    seen: []bool,
     value: ConsumedValue,
 ) !void {
     // Values are always recorded under the canonical name, never under the
@@ -1004,7 +1074,6 @@ fn appendFlag(
             if (std.mem.eql(u8, item.name, spec.name)) {
                 item.value = value.raw;
                 item.parsed_value = value.parsed;
-                seen[spec_index] = true;
                 return;
             }
         }
@@ -1014,7 +1083,13 @@ fn appendFlag(
         .value = value.raw,
         .parsed_value = value.parsed,
     });
-    seen[spec_index] = true;
+}
+
+fn hasFlag(parsed: *const Parsed, name: []const u8) bool {
+    for (parsed.flags.items) |flag| {
+        if (std.mem.eql(u8, flag.name, name)) return true;
+    }
+    return false;
 }
 
 fn validateArguments(

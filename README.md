@@ -62,61 +62,58 @@ The full example is in [`example/src/main.zig`](example/src/main.zig).
 ## Parsing
 
 ```zig
+const CommandName = cli.CommandEnum(application);
+
 fn run(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
        args: []const [:0]const u8, environ: *const std.process.Environ.Map) !u8 {
-    if (args.len <= 1 or cli.helpRequested(args[1..2])) {
-        try cli.printApplicationHelp(allocator, stdout, application);
+    var invocation = try cli.Invocation.init(
+        allocator,
+        stderr,
+        application,
+        args[1..],
+        environ,
+    );
+    defer invocation.deinit(allocator);
+
+    if (try invocation.printHelpIfRequested(allocator, stdout)) {
         return 0;
     }
 
-    // Canonical lookup resolves aliases; dispatch stays your job.
-    const command = cli.findCommand(application, args[1]) orelse {
-        try stderr.print("error: unknown command '{s}'\n", .{args[1]});
-        return 1;
-    };
+    const name = invocation.getValue([]const u8, "name").?;
+    const command = invocation.getCommand() orelse return error.MissingCommand;
 
-    const rest = args[2..];
-    if (cli.helpRequested(rest)) {
-        try cli.printCommandHelp(allocator, stdout, command);
-        return 0;
+    switch (try command.as(CommandName)) {
+        .greet => return runGreet(name, command),
+        .cat => return runCat(command),
     }
-
-    const parsed = try cli.parseCommand(allocator, stderr, rest, command, environ);
-    const name = parsed.getValue([]const u8, "name").?; // "world" when --name was omitted
-    ...
 }
 ```
 
-`parseCommand` prints a diagnostic and returns `error.ReportedCliError` when the
-command line is invalid, so a caller only has to map that error to a non-zero
-exit status. The lower-level `parse` reports `error.InvalidArgument` without
-printing anything.
+`Invocation.init` prints a diagnostic and returns `error.ReportedCliError` for
+an invalid invocation. Its v1 grammar is
+`app [root options] <command> [command options]`; root options after the
+command are rejected. `getCommand()` returns `null` when no command was given.
 
-For root options before a command, use `parseInvocation`:
+`CommandEnum` generates an enum from canonical command names. An alias resolves
+to its canonical tag. A command name that is not a Zig identifier is a quoted
+tag, such as `CommandName.@"good-morning"`.
+
+Arguments after `--` are preserved separately for pass-through commands:
 
 ```zig
-var invocation = try cli.parseInvocation(
-    allocator,
-    stderr,
-    args[1..],
-    application,
-    environ,
-);
-defer invocation.deinit(allocator);
-
-const command = invocation.command orelse return 1;
-const name = invocation.root.getValue([]const u8, "name").?;
+const journal = command.positionals()[0];
+const child_argv = command.passthrough() orelse &.{};
 ```
 
-Its v1 grammar is `app [root options] <command> [command options]`; root
-options after the command are rejected.
+`passthrough()` returns `null` when no separator was supplied. A trailing `--`
+returns a non-null empty slice.
 
 ### Reading results
 
 ```zig
-const name = parsed.getValue([]const u8, "name").?;
-const times = parsed.getValue(usize, "times").?;
-const color = parsed.getValue([]const u8, "color").?;
+const name = invocation.getValue([]const u8, "name").?;
+const times = command.getValue(usize, "times").?;
+const color = command.getValue([]const u8, "color").?;
 ```
 
 Defaults are resolved automatically when an option is omitted.
@@ -131,8 +128,11 @@ layout, see [Value Resolution](docs/value-resolution.md).
 
 ## Help
 
-`printApplicationHelp` and `printCommandHelp` are generated entirely from the
-specification, including aliases, choices, defaults, and repeatable markers.
+Call `invocation.printHelpIfRequested(allocator, writer)` once after
+initialization. It prints application help for root `--help` and command help
+for `--help` after the selected command, including after root options. Help is
+generated from the specification, including aliases, choices, defaults, and
+repeatable markers.
 
 ## Shell completion
 

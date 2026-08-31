@@ -376,6 +376,40 @@ test "Parsed.last: returns null for absent flag" {
     try testing.expect(result.last("missing") == null);
 }
 
+test "Parsed.last: returns the declared default for an omitted flag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const specs = [_]cli.FlagSpec{.{
+        .name = "name",
+        .value = .string,
+        .default_value = "world",
+    }};
+    const result = try cli.parse(arena.allocator(), &.{}, &specs);
+
+    try testing.expectEqualStrings("world", result.last("name").?);
+    try testing.expect(!result.present("name"));
+    try testing.expectEqual(cli.ValueSource.default, result.flags.items[0].source);
+}
+
+test "Parsed.last: an explicit value overrides the declared default" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const specs = [_]cli.FlagSpec{.{
+        .name = "name",
+        .value = .string,
+        .default_value = "world",
+    }};
+    const args = [_][:0]const u8{ "--name", "Zig" };
+    const result = try cli.parse(arena.allocator(), &args, &specs);
+
+    try testing.expectEqualStrings("Zig", result.last("name").?);
+    try testing.expect(result.present("name"));
+    try testing.expectEqual(@as(usize, 1), result.flags.items.len);
+    try testing.expectEqual(cli.ValueSource.command_line, result.flags.items[0].source);
+}
+
 test "Parsed.last: returns last occurrence for repeatable flag" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

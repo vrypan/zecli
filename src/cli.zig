@@ -82,9 +82,15 @@ const help_line_width = 120;
 /// which `printOption` falls back to its allocator.
 const suffix_stack_size = 256;
 
+pub const ValueSource = enum {
+    command_line,
+    default,
+};
+
 pub const FlagValue = struct {
     name: []const u8,
     value: ?[]const u8 = null,
+    source: ValueSource = .command_line,
 };
 
 pub const Parsed = struct {
@@ -101,7 +107,7 @@ pub const Parsed = struct {
 
     pub fn present(self: *const Parsed, name: []const u8) bool {
         for (self.flags.items) |flag| {
-            if (std.mem.eql(u8, flag.name, name)) return true;
+            if (flag.source == .command_line and std.mem.eql(u8, flag.name, name)) return true;
         }
         return false;
     }
@@ -461,7 +467,27 @@ fn parseInternal(
             try parseShort(allocator, args, &i, specs, &parsed, diagnostic);
         }
     }
+    try appendDefaults(allocator, &parsed, specs);
     return parsed;
+}
+
+fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec) !void {
+    for (specs) |spec| {
+        const value = spec.default_value orelse continue;
+        if (hasFlag(parsed, spec.name)) continue;
+        try parsed.flags.append(allocator, .{
+            .name = spec.name,
+            .value = value,
+            .source = .default,
+        });
+    }
+}
+
+fn hasFlag(parsed: *const Parsed, name: []const u8) bool {
+    for (parsed.flags.items) |flag| {
+        if (std.mem.eql(u8, flag.name, name)) return true;
+    }
+    return false;
 }
 
 fn parseLong(

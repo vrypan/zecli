@@ -159,7 +159,7 @@ fn run(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
     }
 
     const parsed = try cli.parseCommand(allocator, stderr, rest, command);
-    const name = parsed.last("name") orelse "world";
+    const name = parsed.last("name").?; // "world" when --name was omitted
     ...
 }
 ```
@@ -198,9 +198,15 @@ printing anything.
 ```zig
 parsed.present("shout")     // bool: was the option given?
 parsed.last("color")        // ?[]const u8: the final value, if any
-parsed.flags.items          // every occurrence, in order, under canonical names
+parsed.flags.items          // explicit occurrences plus defaults, under canonical names
 parsed.positionals.items    // positional arguments
 ```
+
+When an option is omitted and its specification has a `default_value`, the
+default is added to the parsed result. `last` therefore returns the effective
+value. `present` remains false for a defaulted option because it reports
+whether the option appeared on the command line. Each `FlagValue.source`
+distinguishes `.command_line` from `.default`.
 
 Parsed strings borrow from `argv` and from the specification, so nothing is
 copied. If you are not using an arena, release the two buffers explicitly:

@@ -218,11 +218,11 @@ fn runGreet(
     const parsed = try cli.parseCommand(allocator, stderr, args, spec);
 
     // --colour always is recorded under the canonical name "color".
-    const color = parsed.last("color") orelse "auto";
+    const color = parsed.last("color").?;
     const shout = parsed.present("shout") or std.mem.eql(u8, color, "always");
 
-    const name = parsed.last("name") orelse "world";
-    const times = try std.fmt.parseInt(usize, parsed.last("times") orelse "1", 10);
+    const name = parsed.last("name").?;
+    const times = try std.fmt.parseInt(usize, parsed.last("times").?, 10);
 
     var i: usize = 0;
     while (i < times) : (i += 1) {

@@ -38,6 +38,7 @@ const greet_flags = [_]cli.FlagSpec{
 
 const application = cli.ApplicationSpec{
     .name = "zecli-example",
+    .prefix = "MY_APP",
     .description = "Small example program using zecli.",
     .usage = "zecli-example [options] <command>",
     .flags = &root_flags,
@@ -62,7 +63,7 @@ The full example is in [`example/src/main.zig`](example/src/main.zig).
 
 ```zig
 fn run(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
-       args: []const [:0]const u8) !u8 {
+       args: []const [:0]const u8, environ: *const std.process.Environ.Map) !u8 {
     if (args.len <= 1 or cli.helpRequested(args[1..2])) {
         try cli.printApplicationHelp(allocator, stdout, application);
         return 0;
@@ -80,7 +81,7 @@ fn run(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
         return 0;
     }
 
-    const parsed = try cli.parseCommand(allocator, stderr, rest, command);
+    const parsed = try cli.parseCommand(allocator, stderr, rest, command, environ);
     const name = parsed.getValue([]const u8, "name").?; // "world" when --name was omitted
     ...
 }
@@ -100,6 +101,11 @@ const color = parsed.getValue([]const u8, "color").?;
 ```
 
 Defaults are resolved automatically when an option is omitted.
+
+When `ApplicationSpec.prefix` is set, omitted value-taking options also read a
+matching environment variable. For example, `--first-name` reads
+`MY_APP_FIRST_NAME`. Command-line values take precedence over environment
+values, which take precedence over defaults.
 
 For raw access, checked conversions, repeatable values, and the parsed-result
 layout, see [Value Resolution](docs/value-resolution.md).

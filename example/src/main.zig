@@ -144,6 +144,7 @@ const commands = [_]cli.CommandSpec{
 // the validation never reaches the binary.
 const application = cli.comptimeValidated(.{
     .name = "zecli-example",
+    .prefix = "ZECLI_EXAMPLE",
     .description = "Small example program using zecli.",
     .usage = "zecli-example [options] <command>",
     .flags = &root_flags,
@@ -166,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
     const stdout = FileWriter{ .file = .stdout() };
     const stderr = FileWriter{ .file = .stderr() };
 
-    const exit_code = run(allocator, stdout, stderr, args) catch |err| {
+    const exit_code = run(allocator, stdout, stderr, args, init.environ_map) catch |err| {
         if (err == error.ReportedCliError) return std.process.exit(1);
         try stderr.print("error: {s}\n", .{@errorName(err)});
         return std.process.exit(1);
@@ -179,6 +180,7 @@ fn run(
     stdout: anytype,
     stderr: anytype,
     args: []const [:0]const u8,
+    environ: *const std.process.Environ.Map,
 ) !u8 {
     if (args.len <= 1 or cli.helpRequested(args[1..2])) {
         try cli.printApplicationHelp(allocator, stdout, application);
@@ -202,10 +204,10 @@ fn run(
         return 0;
     }
 
-    if (std.mem.eql(u8, command.name, "greet")) return runGreet(allocator, stdout, stderr, command, rest);
-    if (std.mem.eql(u8, command.name, "cat")) return runCat(allocator, stdout, stderr, command, rest);
-    if (std.mem.eql(u8, command.name, "complete")) return runComplete(allocator, stdout, stderr, command, rest);
-    return runCompletion(allocator, stdout, stderr, command, rest);
+    if (std.mem.eql(u8, command.name, "greet")) return runGreet(allocator, stdout, stderr, command, rest, environ);
+    if (std.mem.eql(u8, command.name, "cat")) return runCat(allocator, stdout, stderr, command, rest, environ);
+    if (std.mem.eql(u8, command.name, "complete")) return runComplete(allocator, stdout, stderr, command, rest, environ);
+    return runCompletion(allocator, stdout, stderr, command, rest, environ);
 }
 
 fn runGreet(
@@ -214,8 +216,9 @@ fn runGreet(
     stderr: anytype,
     spec: cli.CommandSpec,
     args: []const [:0]const u8,
+    environ: *const std.process.Environ.Map,
 ) !u8 {
-    const parsed = try cli.parseCommand(allocator, stderr, args, spec);
+    const parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
 
     // --colour always is recorded under the canonical name "color".
     const color = parsed.getValue([]const u8, "color").?;
@@ -243,8 +246,9 @@ fn runCat(
     stderr: anytype,
     spec: cli.CommandSpec,
     args: []const [:0]const u8,
+    environ: *const std.process.Environ.Map,
 ) !u8 {
-    var parsed = try cli.parseCommand(allocator, stderr, args, spec);
+    var parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
     // Not required here, since main uses an arena, but this is the form a
     // caller with a general-purpose allocator would use.
     defer parsed.deinit(allocator);
@@ -260,8 +264,9 @@ fn runComplete(
     stderr: anytype,
     spec: cli.CommandSpec,
     args: []const [:0]const u8,
+    environ: *const std.process.Environ.Map,
 ) !u8 {
-    const parsed = try cli.parseCommand(allocator, stderr, args, spec);
+    const parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
     const prefix = if (parsed.positionals.items.len > 0) parsed.positionals.items[0] else "";
 
     // One candidate per line on stdout is the whole external-completer contract.
@@ -279,8 +284,9 @@ fn runCompletion(
     stderr: anytype,
     spec: cli.CommandSpec,
     args: []const [:0]const u8,
+    environ: *const std.process.Environ.Map,
 ) !u8 {
-    const parsed = try cli.parseCommand(allocator, stderr, args, spec);
+    const parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
     const shell = parsed.positionals.items[0];
 
     if (std.mem.eql(u8, shell, "bash")) {

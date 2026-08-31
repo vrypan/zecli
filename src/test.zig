@@ -11,6 +11,7 @@ const NullWriter = struct {
 };
 
 const nw = NullWriter{};
+var empty_environ = std.process.Environ.Map.init(std.heap.page_allocator);
 
 // ── parseBool ────────────────────────────────────────────────────────────────
 
@@ -519,7 +520,7 @@ test "parseCommand: rejects too few required arguments" {
         .usage = "test <FILE>",
         .arguments = &.{.{ .name = "FILE", .required = true }},
     };
-    try testing.expectError(error.ReportedCliError, cli.parseCommand(arena.allocator(), nw, &.{}, spec));
+    try testing.expectError(error.ReportedCliError, cli.parseCommand(arena.allocator(), nw, &.{}, spec, &empty_environ));
 }
 
 test "parseCommand: rejects too many arguments" {
@@ -533,7 +534,7 @@ test "parseCommand: rejects too many arguments" {
         .arguments = &.{.{ .name = "FILE" }},
     };
     const args = [_][:0]const u8{ "a.txt", "b.txt" };
-    try testing.expectError(error.ReportedCliError, cli.parseCommand(arena.allocator(), nw, &args, spec));
+    try testing.expectError(error.ReportedCliError, cli.parseCommand(arena.allocator(), nw, &args, spec, &empty_environ));
 }
 
 test "parseCommand: accepts exact required argument count" {
@@ -547,7 +548,7 @@ test "parseCommand: accepts exact required argument count" {
         .arguments = &.{.{ .name = "FILE", .required = true }},
     };
     const args = [_][:0]const u8{"myfile.txt"};
-    const result = try cli.parseCommand(arena.allocator(), nw, &args, spec);
+    const result = try cli.parseCommand(arena.allocator(), nw, &args, spec, &empty_environ);
 
     try testing.expectEqualStrings("myfile.txt", result.positionals.items[0]);
 }
@@ -561,7 +562,7 @@ test "parseCommand: accepts zero args when none specified" {
         .description = "test",
         .usage = "test",
     };
-    const result = try cli.parseCommand(arena.allocator(), nw, &.{}, spec);
+    const result = try cli.parseCommand(arena.allocator(), nw, &.{}, spec, &empty_environ);
     try testing.expectEqual(@as(usize, 0), result.positionals.items.len);
 }
 
@@ -576,7 +577,7 @@ test "parseCommand: repeatable argument accepts multiple values" {
         .arguments = &.{.{ .name = "FILE", .required = true, .repeatable = true }},
     };
     const args = [_][:0]const u8{ "a.txt", "b.txt", "c.txt" };
-    const result = try cli.parseCommand(arena.allocator(), nw, &args, spec);
+    const result = try cli.parseCommand(arena.allocator(), nw, &args, spec, &empty_environ);
 
     try testing.expectEqual(@as(usize, 3), result.positionals.items.len);
 }
@@ -591,7 +592,7 @@ test "parseCommand: unknown flag returns ReportedCliError" {
         .usage = "test [options]",
     };
     const args = [_][:0]const u8{"--unknown"};
-    try testing.expectError(error.ReportedCliError, cli.parseCommand(arena.allocator(), nw, &args, spec));
+    try testing.expectError(error.ReportedCliError, cli.parseCommand(arena.allocator(), nw, &args, spec, &empty_environ));
 }
 
 test "parseCommand: flags and positionals coexist" {
@@ -606,10 +607,124 @@ test "parseCommand: flags and positionals coexist" {
         .arguments = &.{.{ .name = "FILE", .required = true }},
     };
     const args = [_][:0]const u8{ "--output", "out.txt", "in.txt" };
-    const result = try cli.parseCommand(arena.allocator(), nw, &args, spec);
+    const result = try cli.parseCommand(arena.allocator(), nw, &args, spec, &empty_environ);
 
     try testing.expectEqualStrings("out.txt", result.last("output").?);
     try testing.expectEqualStrings("in.txt", result.positionals.items[0]);
+}
+
+test "parseCommand: resolves environment values from the application prefix" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_FIRST_NAME", "Ada");
+    try environ.put("MY_APP_TIMES", "3");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{
+                .{ .name = "first-name", .value = .string, .default_value = "world" },
+                .{ .name = "times", .value = .int, .default_value = "1" },
+            },
+        }},
+    };
+    const command = cli.findCommand(application, "greet").?;
+    const result = try cli.parseCommand(allocator, nw, &.{}, command, &environ);
+
+    try testing.expectEqualStrings("Ada", result.getValue([]const u8, "first-name").?);
+    try testing.expectEqual(@as(usize, 3), result.getValue(usize, "times").?);
+    try testing.expect(!result.present("first-name"));
+    try testing.expectEqual(cli.ValueSource.environment, result.flags.items[0].source);
+}
+
+test "parseCommand: command line values override environment values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_NAME", "Jane");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "name", .value = .string, .default_value = "world" }},
+        }},
+    };
+    const command = cli.findCommand(application, "greet").?;
+    const args = [_][:0]const u8{ "--name", "John" };
+    const result = try cli.parseCommand(allocator, nw, &args, command, &environ);
+
+    try testing.expectEqualStrings("John", result.getValue([]const u8, "name").?);
+    try testing.expect(result.present("name"));
+    try testing.expectEqual(cli.ValueSource.command_line, result.flags.items[0].source);
+}
+
+test "parseCommand: ignores environment values without an application prefix" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_NAME", "Jane");
+
+    const spec = cli.CommandSpec{
+        .name = "greet",
+        .description = "d",
+        .usage = "u",
+        .flags = &.{.{ .name = "name", .value = .string, .default_value = "world" }},
+    };
+    const result = try cli.parseCommand(allocator, nw, &.{}, spec, &environ);
+
+    try testing.expectEqualStrings("world", result.getValue([]const u8, "name").?);
+    try testing.expectEqual(cli.ValueSource.default, result.flags.items[0].source);
+}
+
+test "parseCommand: reports an invalid environment value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_TIMES", "many");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "times", .value = .int }},
+        }},
+    };
+    const command = cli.findCommand(application, "greet").?;
+    var buffer = Buffer.init(allocator);
+    defer buffer.deinit();
+
+    try testing.expectError(error.ReportedCliError, cli.parseCommand(allocator, &buffer, &.{}, command, &environ));
+    try testing.expect(std.mem.indexOf(u8, buffer.bytes.items, "invalid environment value for '--times'") != null);
 }
 
 // ── A representative application ─────────────────────────────────────────────
@@ -839,7 +954,7 @@ test "parseCommand: an invalid choice names the option, value, and allowed value
     const args = [_][:0]const u8{ "--colour", "sometimes", "pattern" };
     try testing.expectError(
         error.ReportedCliError,
-        cli.parseCommand(arena.allocator(), &buffer, &args, grep_spec),
+        cli.parseCommand(arena.allocator(), &buffer, &args, grep_spec, &empty_environ),
     );
 
     try testing.expect(std.mem.indexOf(u8, buffer.items(), "--color") != null);
@@ -859,7 +974,7 @@ test "parseCommand: a missing required value is reported" {
     const args = [_][:0]const u8{"--color"};
     try testing.expectError(
         error.ReportedCliError,
-        cli.parseCommand(arena.allocator(), &buffer, &args, grep_spec),
+        cli.parseCommand(arena.allocator(), &buffer, &args, grep_spec, &empty_environ),
     );
     try testing.expect(std.mem.indexOf(u8, buffer.items(), "requires <WHEN>") != null);
 }
@@ -891,7 +1006,7 @@ test "parseCommand: releases the parse buffers when arguments are rejected" {
     };
     try testing.expectError(
         error.ReportedCliError,
-        cli.parseCommand(testing.allocator, nw, &.{}, spec),
+        cli.parseCommand(testing.allocator, nw, &.{}, spec, &empty_environ),
     );
 }
 

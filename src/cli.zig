@@ -60,10 +60,13 @@ pub const CommandSpec = struct {
     flags: []const FlagSpec = &.{},
     arguments: []const ArgumentSpec = &.{},
     extra_help: ?[]const u8 = null,
+    /// Set by `findCommand` from the containing application's `prefix`.
+    environment_prefix: ?[]const u8 = null,
 };
 
 pub const ApplicationSpec = struct {
     name: []const u8,
+    prefix: ?[]const u8 = null,
     description: []const u8,
     usage: []const u8,
     flags: []const FlagSpec = &.{},
@@ -86,6 +89,7 @@ const suffix_stack_size = 256;
 
 pub const ValueSource = enum {
     command_line,
+    environment,
     default,
 };
 
@@ -115,8 +119,8 @@ pub const Parsed = struct {
     flags: std.ArrayList(FlagValue) = .empty,
     positionals: std.ArrayList([]const u8) = .empty,
 
-    /// Releases the two buffers. Flag names and values are borrowed from argv
-    /// and from the specification, so they are not freed.
+    /// Releases the two buffers. Flag names and values are borrowed from argv,
+    /// the environment map, and the specification, so they are not freed.
     pub fn deinit(self: *Parsed, allocator: Allocator) void {
         self.flags.deinit(allocator);
         self.positionals.deinit(allocator);
@@ -230,12 +234,18 @@ fn convertValue(comptime T: type, flag: FlagValue) GetValueAsError!T {
 /// canonical specification.
 pub fn findCommand(application: ApplicationSpec, token: []const u8) ?CommandSpec {
     for (application.commands) |command| {
-        if (std.mem.eql(u8, command.name, token)) return command;
+        if (std.mem.eql(u8, command.name, token)) return resolvedCommand(application, command);
         for (command.aliases) |alias| {
-            if (std.mem.eql(u8, alias, token)) return command;
+            if (std.mem.eql(u8, alias, token)) return resolvedCommand(application, command);
         }
     }
     return null;
+}
+
+fn resolvedCommand(application: ApplicationSpec, command: CommandSpec) CommandSpec {
+    var result = command;
+    result.environment_prefix = application.prefix;
+    return result;
 }
 
 /// Resolves a long option name, which may be a canonical name or an alias, to
@@ -250,18 +260,28 @@ pub fn findApplicationFlag(application: ApplicationSpec, token: []const u8) ?Fla
 }
 
 fn findLong(specs: []const FlagSpec, name: []const u8) ?FlagSpec {
-    for (specs) |spec| {
-        if (std.mem.eql(u8, spec.name, name)) return spec;
+    const index = findLongIndex(specs, name) orelse return null;
+    return specs[index];
+}
+
+fn findLongIndex(specs: []const FlagSpec, name: []const u8) ?usize {
+    for (specs, 0..) |spec, i| {
+        if (std.mem.eql(u8, spec.name, name)) return i;
         for (spec.aliases) |alias| {
-            if (std.mem.eql(u8, alias, name)) return spec;
+            if (std.mem.eql(u8, alias, name)) return i;
         }
     }
     return null;
 }
 
 fn findShort(specs: []const FlagSpec, short: u8) ?FlagSpec {
-    for (specs) |spec| {
-        if (spec.short == short) return spec;
+    const index = findShortIndex(specs, short) orelse return null;
+    return specs[index];
+}
+
+fn findShortIndex(specs: []const FlagSpec, short: u8) ?usize {
+    for (specs, 0..) |spec, i| {
+        if (spec.short == short) return i;
     }
     return null;
 }
@@ -488,6 +508,7 @@ const ParseIssue = enum {
     invalid_float,
     invalid_bool,
     invalid_choice,
+    invalid_environment_value,
     unexpected_inline_value,
     unsupported_short_cluster,
     attached_short_value,
@@ -509,9 +530,10 @@ pub fn parseCommand(
     writer: anytype,
     args: []const [:0]const u8,
     spec: CommandSpec,
+    environ: *const std.process.Environ.Map,
 ) !Parsed {
     var diagnostic = ParseDiagnostic{};
-    var parsed = parseInternal(allocator, args, spec.flags, &diagnostic) catch |err| {
+    var parsed = parseInternal(allocator, args, spec.flags, spec.environment_prefix, environ, &diagnostic) catch |err| {
         if (err != error.InvalidArgument) return err;
         try printParseError(writer, spec, diagnostic);
         return error.ReportedCliError;
@@ -526,7 +548,7 @@ pub fn parseCommand(
 }
 
 pub fn parse(allocator: Allocator, args: []const [:0]const u8, specs: []const FlagSpec) !Parsed {
-    return parseInternal(allocator, args, specs, null);
+    return parseInternal(allocator, args, specs, null, null, null);
 }
 
 /// Reports whether the caller should print help. Scanning stops at the first
@@ -543,10 +565,15 @@ fn parseInternal(
     allocator: Allocator,
     args: []const [:0]const u8,
     specs: []const FlagSpec,
+    environment_prefix: ?[]const u8,
+    environ: ?*const std.process.Environ.Map,
     diagnostic: ?*ParseDiagnostic,
 ) !Parsed {
     var parsed = Parsed{};
     errdefer parsed.deinit(allocator);
+    const seen = try allocator.alloc(bool, specs.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -566,19 +593,22 @@ fn parseInternal(
                 }
                 break;
             }
-            try parseLong(allocator, args, &i, specs, &parsed, diagnostic);
+            try parseLong(allocator, args, &i, specs, seen, &parsed, diagnostic);
         } else {
-            try parseShort(allocator, args, &i, specs, &parsed, diagnostic);
+            try parseShort(allocator, args, &i, specs, seen, &parsed, diagnostic);
         }
     }
-    try appendDefaults(allocator, &parsed, specs);
+    if (environment_prefix) |prefix| {
+        try appendEnvironment(allocator, &parsed, specs, seen, prefix, environ.?, diagnostic);
+    }
+    try appendDefaults(allocator, &parsed, specs, seen);
     return parsed;
 }
 
-fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec) !void {
-    for (specs) |spec| {
+fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec, seen: []bool) !void {
+    for (specs, 0..) |spec, i| {
         const value = spec.default_value orelse continue;
-        if (hasFlag(parsed, spec.name)) continue;
+        if (seen[i]) continue;
         const parsed_value = try parseDefaultValue(spec, value);
         try parsed.flags.append(allocator, .{
             .name = spec.name,
@@ -586,14 +616,58 @@ fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec
             .parsed_value = parsed_value,
             .source = .default,
         });
+        seen[i] = true;
     }
 }
 
-fn hasFlag(parsed: *const Parsed, name: []const u8) bool {
-    for (parsed.flags.items) |flag| {
-        if (std.mem.eql(u8, flag.name, name)) return true;
+fn appendEnvironment(
+    allocator: Allocator,
+    parsed: *Parsed,
+    specs: []const FlagSpec,
+    seen: []bool,
+    prefix: []const u8,
+    environ: *const std.process.Environ.Map,
+    diagnostic: ?*ParseDiagnostic,
+) !void {
+    for (specs, 0..) |spec, i| {
+        if (seen[i] or !takesValue(spec)) continue;
+
+        var fallback = std.heap.stackFallback(128, allocator);
+        const name_allocator = fallback.get();
+        var name: std.ArrayList(u8) = .empty;
+        defer name.deinit(name_allocator);
+        try name.appendSlice(name_allocator, prefix);
+        try name.append(name_allocator, '_');
+        for (spec.name) |char| {
+            try name.append(name_allocator, if (char == '-') '_' else std.ascii.toUpper(char));
+        }
+
+        const raw = environ.get(name.items) orelse continue;
+        const parsed_value = parseDefaultValue(spec, raw) catch {
+            setDiagnostic(diagnostic, .{
+                .issue = .invalid_environment_value,
+                .flag_name = spec.name,
+                .value = raw,
+            });
+            return error.InvalidArgument;
+        };
+        if (spec.choices.len > 0 and !containsString(spec.choices, raw)) {
+            setDiagnostic(diagnostic, .{
+                .issue = .invalid_environment_value,
+                .flag_name = spec.name,
+                .value = raw,
+            });
+            return error.InvalidArgument;
+        }
+
+        try parsed.flags.append(allocator, .{
+            .name = spec.name,
+            .value = raw,
+            .parsed_value = parsed_value,
+            .source = .environment,
+        });
+        seen[i] = true;
     }
-    return false;
 }
 
 fn parseLong(
@@ -601,6 +675,7 @@ fn parseLong(
     args: []const [:0]const u8,
     index: *usize,
     specs: []const FlagSpec,
+    seen: []bool,
     parsed: *Parsed,
     diagnostic: ?*ParseDiagnostic,
 ) !void {
@@ -610,13 +685,14 @@ fn parseLong(
     const name = if (eql_pos) |pos| raw[0..pos] else raw;
     const inline_value = if (eql_pos) |pos| raw[pos + 1 ..] else null;
 
-    const spec = findLong(specs, name) orelse {
+    const spec_index = findLongIndex(specs, name) orelse {
         setDiagnostic(diagnostic, .{ .issue = .unknown_option, .token = arg });
         return error.InvalidArgument;
     };
+    const spec = specs[spec_index];
 
     const value = try consumeValue(args, index, spec, inline_value, arg, diagnostic);
-    try appendFlag(allocator, parsed, spec, value);
+    try appendFlag(allocator, parsed, spec, spec_index, seen, value);
 }
 
 fn parseShort(
@@ -624,6 +700,7 @@ fn parseShort(
     args: []const [:0]const u8,
     index: *usize,
     specs: []const FlagSpec,
+    seen: []bool,
     parsed: *Parsed,
     diagnostic: ?*ParseDiagnostic,
 ) !void {
@@ -631,10 +708,11 @@ fn parseShort(
     const body = arg[1..];
     if (body.len == 0) return error.InvalidArgument;
 
-    const spec = findShort(specs, body[0]) orelse {
+    const spec_index = findShortIndex(specs, body[0]) orelse {
         setDiagnostic(diagnostic, .{ .issue = .unknown_option, .token = arg });
         return error.InvalidArgument;
     };
+    const spec = specs[spec_index];
 
     const inline_value: ?[]const u8 = if (body.len > 1) blk: {
         if (spec.value == .none) {
@@ -653,7 +731,7 @@ fn parseShort(
     } else null;
 
     const value = try consumeValue(args, index, spec, inline_value, arg, diagnostic);
-    try appendFlag(allocator, parsed, spec, value);
+    try appendFlag(allocator, parsed, spec, spec_index, seen, value);
 }
 
 const ConsumedValue = struct {
@@ -817,7 +895,14 @@ fn checkChoices(
     return error.InvalidArgument;
 }
 
-fn appendFlag(allocator: Allocator, parsed: *Parsed, spec: FlagSpec, value: ConsumedValue) !void {
+fn appendFlag(
+    allocator: Allocator,
+    parsed: *Parsed,
+    spec: FlagSpec,
+    spec_index: usize,
+    seen: []bool,
+    value: ConsumedValue,
+) !void {
     // Values are always recorded under the canonical name, never under the
     // alias the caller happened to type.
     if (!spec.repeatable) {
@@ -825,6 +910,7 @@ fn appendFlag(allocator: Allocator, parsed: *Parsed, spec: FlagSpec, value: Cons
             if (std.mem.eql(u8, item.name, spec.name)) {
                 item.value = value.raw;
                 item.parsed_value = value.parsed;
+                seen[spec_index] = true;
                 return;
             }
         }
@@ -834,6 +920,7 @@ fn appendFlag(allocator: Allocator, parsed: *Parsed, spec: FlagSpec, value: Cons
         .value = value.raw,
         .parsed_value = value.parsed,
     });
+    seen[spec_index] = true;
 }
 
 fn validateArguments(
@@ -934,6 +1021,10 @@ fn printParseError(writer: anytype, spec: CommandSpec, diagnostic: ParseDiagnost
             }
             try writer.writeByte('\n');
         },
+        .invalid_environment_value => try writer.print(
+            "error: invalid environment value for '--{s}': '{s}'\n",
+            .{ flag_name, diagnostic.value orelse "" },
+        ),
         .unexpected_inline_value => try writer.print(
             "error: option '--{s}' does not accept a value\n",
             .{diagnostic.flag_name orelse diagnostic.token},

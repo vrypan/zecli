@@ -25,21 +25,29 @@ requested type does not match the option's stored type.
 
 ## Sources and precedence
 
-Explicit command-line values override defaults. When an option with a
-`default_value` is omitted, zecli adds that default to `Parsed.flags`.
+Set `ApplicationSpec.prefix` to enable environment values. An option's variable
+name is the prefix, an underscore, and its canonical long name in uppercase
+with hyphens changed to underscores. For example, `.prefix = "MY_APP"` makes
+`--first-name` read `MY_APP_FIRST_NAME`.
+
+Explicit command-line values override environment values, which override
+defaults. When an option with a `default_value` is omitted, zecli adds that
+default to `Parsed.flags`.
 
 ```text
 --times 5                 -> 5
+MY_APP_TIMES=3            -> 3 when --times is omitted
 default_value = "10"      -> 10 when --times is omitted
 ```
 
 `parsed.present("times")` is true only when `--times` was passed on the
-command line. `FlagValue.source` distinguishes `.command_line` from
-`.default`.
+command line. `FlagValue.source` distinguishes `.command_line`,
+`.environment`, and `.default`.
 
 Defaults are parsed and validated in the same representation as command-line
-values. For example, an `.int` default must be a valid `usize`, and a `.float`
-default must be a valid `f64`.
+values, and environment values follow that same validation. For example, an
+`.int` value must be a valid `usize`, and a `.float` value must be a valid
+`f64`.
 
 ## Checked conversions
 
@@ -68,8 +76,8 @@ while (items.next()) |item| {
 ```
 
 Values are yielded in command-line order. When a repeatable option is omitted
-and has a default, the iterator yields that default once. Explicit values always
-take precedence over the default.
+and has an environment value or default, the iterator yields that fallback once.
+Explicit values take precedence over environment values and defaults.
 
 ## Raw result access
 

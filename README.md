@@ -171,4 +171,6 @@ git push origin v0.3.1
 ```
 
 You can also run the workflow manually with an existing tag. The workflow uses
-the previous reachable tag as the start of the release range.
+the previous reachable tag as the start of the release range. Release creation
+fails if `build.zig.zon` does not contain the same version as the tag, without
+the leading `v`.

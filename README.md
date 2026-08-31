@@ -151,3 +151,24 @@ try completion.generateFish(writer, application);
 
 Generated scripts handle commands, options, aliases, choices, files,
 directories, and external completers declared in the specification.
+
+## Release Notes
+
+Generate Markdown release notes from commit subjects:
+
+```sh
+scripts/release-notes
+scripts/release-notes v0.3.1
+scripts/release-notes --range v0.3.0..v0.3.1
+```
+
+The `Release` GitHub Actions workflow runs on pushed `v*` tags and creates a
+GitHub Release whose notes come from the same script:
+
+```sh
+git tag v0.3.1
+git push origin v0.3.1
+```
+
+You can also run the workflow manually with an existing tag. The workflow uses
+the previous reachable tag as the start of the release range.

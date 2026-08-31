@@ -210,7 +210,7 @@ fn runGreet(
 ) !u8 {
     // --colour always is recorded under the canonical name "color".
     const color = command.getValue([]const u8, "color").?;
-    const shout = command.present("shout") or std.mem.eql(u8, color, "always");
+    const shout = command.enabled("shout") or std.mem.eql(u8, color, "always");
 
     const name = command.getValue([]const u8, "name").?;
     const times = command.getValue(usize, "times").?;

@@ -736,6 +736,103 @@ test "Invocation: reports an invalid environment value" {
     try testing.expect(std.mem.indexOf(u8, buffer.bytes.items, "invalid environment value for '--times'") != null);
 }
 
+test "Invocation: resolves no-value switches from boolean environment values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_VERBOSE", "true");
+    try environ.put("MY_APP_QUIET", "false");
+    try environ.put("MY_APP_ENABLED", "yes");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{
+                .{ .name = "verbose" },
+                .{ .name = "quiet" },
+                .{ .name = "enabled", .value = .bool_required },
+            },
+        }},
+    };
+    var invocation = try cli.Invocation.init(allocator, nw, application, &.{"greet"}, &environ);
+    defer invocation.deinit(allocator);
+    const command = invocation.getCommand().?;
+
+    try testing.expect(command.enabled("verbose"));
+    try testing.expect(!command.enabled("quiet"));
+    try testing.expect(command.getValue(bool, "verbose").?);
+    try testing.expect(!command.getValue(bool, "quiet").?);
+    try testing.expect(command.getValue(bool, "enabled").?);
+    try testing.expect(!command.present("verbose"));
+}
+
+test "Invocation: command-line switch overrides false environment value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_VERBOSE", "false");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "verbose" }},
+        }},
+    };
+    var invocation = try cli.Invocation.init(allocator, nw, application, &.{ "greet", "--verbose" }, &environ);
+    defer invocation.deinit(allocator);
+    const command = invocation.getCommand().?;
+
+    try testing.expect(command.present("verbose"));
+    try testing.expect(command.enabled("verbose"));
+    try testing.expect(command.getValue(bool, "verbose") == null);
+}
+
+test "Invocation: reports invalid boolean environment values for no-value switches" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("MY_APP_VERBOSE", "maybe");
+
+    const application = cli.ApplicationSpec{
+        .name = "demo",
+        .prefix = "MY_APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "verbose" }},
+        }},
+    };
+    var buffer = Buffer.init(allocator);
+    defer buffer.deinit();
+
+    try testing.expectError(error.ReportedCliError, cli.Invocation.init(allocator, &buffer, application, &.{"greet"}, &environ));
+    try testing.expect(std.mem.indexOf(u8, buffer.bytes.items, "invalid environment value for '--verbose'") != null);
+}
+
 test "Invocation: parses root and command scopes" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -135,6 +135,24 @@ pub const Parsed = struct {
         return false;
     }
 
+    /// Returns the effective boolean state for a switch or typed boolean
+    /// option. Command-line switches are true by presence; environment-backed
+    /// switches and typed boolean values use their parsed boolean value.
+    pub fn enabled(self: *const Parsed, name: []const u8) bool {
+        var i = self.flags.items.len;
+        while (i > 0) {
+            i -= 1;
+            const flag = self.flags.items[i];
+            if (!std.mem.eql(u8, flag.name, name)) continue;
+            if (flag.source == .command_line and flag.parsed_value == .none) return true;
+            return switch (flag.parsed_value) {
+                .bool => |value| value,
+                else => false,
+            };
+        }
+        return false;
+    }
+
     pub fn last(self: *const Parsed, name: []const u8) ?[]const u8 {
         var i = self.flags.items.len;
         while (i > 0) {
@@ -186,6 +204,10 @@ pub const Command = struct {
 
     pub fn present(self: *const Command, option: []const u8) bool {
         return self.parsed.present(option);
+    }
+
+    pub fn enabled(self: *const Command, option: []const u8) bool {
+        return self.parsed.enabled(option);
     }
 
     pub fn getValue(self: *const Command, comptime T: type, option: []const u8) ?T {
@@ -243,6 +265,10 @@ pub const Invocation = struct {
 
     pub fn present(self: *const Invocation, option: []const u8) bool {
         return self.root.present(option);
+    }
+
+    pub fn enabled(self: *const Invocation, option: []const u8) bool {
+        return self.root.enabled(option);
     }
 
     pub fn getValue(self: *const Invocation, comptime T: type, option: []const u8) ?T {
@@ -841,7 +867,7 @@ fn appendEnvironment(
     diagnostic: ?*ParseDiagnostic,
 ) !void {
     for (specs) |spec| {
-        if (hasFlag(parsed, spec.name) or !takesValue(spec)) continue;
+        if (hasFlag(parsed, spec.name)) continue;
 
         var fallback = std.heap.stackFallback(128, allocator);
         const name_allocator = fallback.get();
@@ -854,7 +880,7 @@ fn appendEnvironment(
         }
 
         const raw = environ.get(name.items) orelse continue;
-        const parsed_value = decodeValue(spec, raw) catch {
+        const parsed_value = decodeEnvironmentValue(spec, raw) catch {
             setDiagnostic(diagnostic, .{
                 .issue = .invalid_environment_value,
                 .flag_name = spec.name,
@@ -878,6 +904,11 @@ fn appendEnvironment(
             .source = .environment,
         });
     }
+}
+
+fn decodeEnvironmentValue(spec: FlagSpec, raw: []const u8) !ParsedValue {
+    if (spec.value == .none) return .{ .bool = try parseBool(raw) };
+    return decodeValue(spec, raw);
 }
 
 fn parseLong(

@@ -114,6 +114,7 @@ returns a non-null empty slice.
 const name = invocation.getValue([]const u8, "name").?;
 const times = command.getValue(usize, "times").?;
 const color = command.getValue([]const u8, "color").?;
+const shout = command.enabled("shout");
 ```
 
 Defaults are resolved automatically when an option is omitted.
@@ -121,7 +122,9 @@ Defaults are resolved automatically when an option is omitted.
 When `ApplicationSpec.prefix` is set, omitted value-taking options also read a
 matching environment variable. For example, `--first-name` reads
 `MY_APP_FIRST_NAME`. Command-line values take precedence over environment
-values, which take precedence over defaults.
+values, which take precedence over defaults. No-value switches read boolean
+environment values, so `MY_APP_SHOUT=true` enables `--shout` when the option is
+omitted.
 
 For raw access, checked conversions, repeatable values, and the parsed-result
 layout, see [Value Resolution](docs/value-resolution.md).

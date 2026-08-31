@@ -23,7 +23,7 @@ requested type does not match the option's stored type.
 | `.signed_int` | signed integer | `i64` |
 | `.float` | floating-point number | `f64` |
 | `.bool_required`, `.bool_optional` | boolean | `bool` |
-| `.none` | no value | none; use `present` |
+| `.none` | no command-line value; environment values parse as booleans | use `present` for command-line presence or `enabled` for effective boolean state |
 
 ## Sources and precedence
 
@@ -43,13 +43,23 @@ default_value = "10"      -> 10 when --times is omitted
 ```
 
 `parsed.present("times")` is true only when `--times` was passed on the
-command line. `FlagValue.source` distinguishes `.command_line`,
-`.environment`, and `.default`.
+command line. For boolean options and no-value switches, use
+`parsed.enabled("name")` to read the effective boolean state across command
+line, environment, and default sources. `FlagValue.source` distinguishes
+`.command_line`, `.environment`, and `.default`.
 
 Defaults are parsed and validated in the same representation as command-line
 values, and environment values follow that same validation. For example, an
 `.int` value must be a valid `usize`, and a `.float` value must be a valid
 `f64`.
+
+No-value switches read environment variables as booleans:
+
+```text
+--shout                   -> enabled("shout") == true
+MY_APP_SHOUT=true         -> enabled("shout") == true when --shout is omitted
+MY_APP_SHOUT=false        -> enabled("shout") == false when --shout is omitted
+```
 
 `Invocation.init` applies this same resolution to application/root flags before
 parsing the selected command. Its v1 grammar accepts root options only before

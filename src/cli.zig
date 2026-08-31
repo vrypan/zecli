@@ -178,6 +178,23 @@ pub const Parsed = struct {
     }
 };
 
+pub const ParsedInvocation = struct {
+    pub const Command = struct {
+        spec: CommandSpec,
+        parsed: Parsed,
+    };
+
+    root: Parsed = .{},
+    command: ?Command = null,
+    command_token: ?[]const u8 = null,
+
+    pub fn deinit(self: *ParsedInvocation, allocator: Allocator) void {
+        self.root.deinit(allocator);
+        if (self.command) |*command| command.parsed.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 pub fn ValueIterator(comptime T: type) type {
     return struct {
         parsed: *const Parsed,
@@ -545,6 +562,83 @@ pub fn parseCommand(
         return error.ReportedCliError;
     };
     return parsed;
+}
+
+/// Parses an application invocation with root options before its command.
+/// Root options after the command are not supported by this entry point.
+pub fn parseInvocation(
+    allocator: Allocator,
+    writer: anytype,
+    args: []const [:0]const u8,
+    application: ApplicationSpec,
+    environ: *const std.process.Environ.Map,
+) !ParsedInvocation {
+    const boundary = rootCommandBoundary(application, args);
+    const root_args = args[0..boundary];
+    const root_spec = CommandSpec{
+        .name = application.name,
+        .description = application.description,
+        .usage = application.usage,
+        .flags = application.flags,
+    };
+
+    var diagnostic = ParseDiagnostic{};
+    var root = parseInternal(allocator, root_args, application.flags, application.prefix, environ, &diagnostic) catch |err| {
+        if (err != error.InvalidArgument) return err;
+        try printParseError(writer, root_spec, diagnostic);
+        return error.ReportedCliError;
+    };
+    errdefer root.deinit(allocator);
+
+    if (boundary == args.len) return .{ .root = root };
+
+    const token = args[boundary];
+    const command_spec = findCommand(application, token) orelse {
+        return .{ .root = root, .command_token = token };
+    };
+    const command_parsed = try parseCommand(allocator, writer, args[boundary + 1 ..], command_spec, environ);
+    return .{
+        .root = root,
+        .command = .{ .spec = command_spec, .parsed = command_parsed },
+        .command_token = token,
+    };
+}
+
+fn rootCommandBoundary(application: ApplicationSpec, args: []const [:0]const u8) usize {
+    var i: usize = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (arg.len == 0 or arg[0] != '-' or arg.len == 1 or std.mem.eql(u8, arg, "--")) return i;
+
+        if (arg[1] == '-') {
+            const raw = arg[2..];
+            const eql_pos = std.mem.indexOfScalar(u8, raw, '=');
+            const name = if (eql_pos) |pos| raw[0..pos] else raw;
+            const inline_value = eql_pos != null;
+            if (findApplicationFlag(application, name)) |flag| {
+                if (rootFlagConsumesNext(application, flag, inline_value, args, i)) i += 1;
+            }
+        } else if (findShort(application.flags, arg[1])) |flag| {
+            if (rootFlagConsumesNext(application, flag, arg.len > 2, args, i)) i += 1;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+fn rootFlagConsumesNext(
+    application: ApplicationSpec,
+    flag: FlagSpec,
+    inline_value: bool,
+    args: []const [:0]const u8,
+    index: usize,
+) bool {
+    if (inline_value or flag.value == .none or index + 1 >= args.len) return false;
+    if (flag.value != .bool_optional) return true;
+
+    const next = args[index + 1];
+    if (next.len == 0 or next[0] == '-') return false;
+    return findCommand(application, next) == null;
 }
 
 pub fn parse(allocator: Allocator, args: []const [:0]const u8, specs: []const FlagSpec) !Parsed {

@@ -92,6 +92,25 @@ command line is invalid, so a caller only has to map that error to a non-zero
 exit status. The lower-level `parse` reports `error.InvalidArgument` without
 printing anything.
 
+For root options before a command, use `parseInvocation`:
+
+```zig
+var invocation = try cli.parseInvocation(
+    allocator,
+    stderr,
+    args[1..],
+    application,
+    environ,
+);
+defer invocation.deinit(allocator);
+
+const command = invocation.command orelse return 1;
+const name = invocation.root.getValue([]const u8, "name").?;
+```
+
+Its v1 grammar is `app [root options] <command> [command options]`; root
+options after the command are rejected.
+
 ### Reading results
 
 ```zig

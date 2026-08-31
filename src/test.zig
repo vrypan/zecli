@@ -727,6 +727,76 @@ test "parseCommand: reports an invalid environment value" {
     try testing.expect(std.mem.indexOf(u8, buffer.bytes.items, "invalid environment value for '--times'") != null);
 }
 
+test "parseInvocation: parses root and command scopes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const application = cli.ApplicationSpec{
+        .name = "say",
+        .prefix = "SAY",
+        .description = "d",
+        .usage = "say [options] <command> [options]",
+        .flags = &.{.{ .name = "name", .value = .string, .default_value = "world" }},
+        .commands = &.{.{
+            .name = "gm",
+            .description = "d",
+            .usage = "say [options] gm [options]",
+            .flags = &.{.{ .name = "day-conditions", .value = .string, .default_value = "clear" }},
+        }},
+    };
+    const args = [_][:0]const u8{ "--name=John", "gm", "--day-conditions=clear" };
+    var invocation = try cli.parseInvocation(allocator, nw, &args, application, &empty_environ);
+    defer invocation.deinit(allocator);
+
+    const command = invocation.command.?;
+    try testing.expectEqualStrings("John", invocation.root.getValue([]const u8, "name").?);
+    try testing.expectEqualStrings("gm", command.spec.name);
+    try testing.expectEqualStrings("clear", command.parsed.getValue([]const u8, "day-conditions").?);
+}
+
+test "parseInvocation: resolves root environment values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("SAY_NAME", "Ada");
+
+    const application = cli.ApplicationSpec{
+        .name = "say",
+        .prefix = "SAY",
+        .description = "d",
+        .usage = "say [options] <command>",
+        .flags = &.{.{ .name = "name", .value = .string, .default_value = "world" }},
+        .commands = &.{.{ .name = "gm", .description = "d", .usage = "u" }},
+    };
+    var invocation = try cli.parseInvocation(allocator, nw, &.{"gm"}, application, &environ);
+    defer invocation.deinit(allocator);
+
+    try testing.expectEqualStrings("Ada", invocation.root.getValue([]const u8, "name").?);
+    try testing.expectEqual(cli.ValueSource.environment, invocation.root.flags.items[0].source);
+}
+
+test "parseInvocation: rejects a root option after the command" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const application = cli.ApplicationSpec{
+        .name = "say",
+        .description = "d",
+        .usage = "say [options] <command> [options]",
+        .flags = &.{.{ .name = "name", .value = .string }},
+        .commands = &.{.{ .name = "gm", .description = "d", .usage = "u" }},
+    };
+    const args = [_][:0]const u8{ "gm", "--name=John" };
+    try testing.expectError(
+        error.ReportedCliError,
+        cli.parseInvocation(arena.allocator(), nw, &args, application, &empty_environ),
+    );
+}
+
 // ── A representative application ─────────────────────────────────────────────
 //
 // The color option is the generic form of the grammar a consumer needs: a

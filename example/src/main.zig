@@ -157,10 +157,8 @@ const demo_references = [_][]const u8{ "@1/out", "@2/out", "@42/out", "note with
 
 pub fn main(init: std.process.Init) !void {
     process_io = init.io;
-    // Everything parsed borrows from argv and from the specification, and the
-    // arena is released when the process exits. `parsed.deinit(allocator)` is
-    // only needed by callers that reuse a general-purpose allocator; runCat
-    // below shows that form.
+    // Everything parsed borrows from argv and from the specification. The
+    // invocation releases its parsing buffers before `run` returns.
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
@@ -191,35 +189,35 @@ fn run(
         return 0;
     }
 
+    if (args.len > 2) {
+        if (cli.findCommand(application, args[1])) |command| {
+            if (cli.helpRequested(args[2..])) {
+                try cli.printCommandHelp(allocator, stdout, command);
+                return 0;
+            }
+        }
+    }
+
+    var invocation = try cli.parseInvocation(allocator, stderr, args[1..], application, environ);
+    defer invocation.deinit(allocator);
+
     // Canonical lookup resolves aliases; dispatch stays the caller's job.
-    const command = cli.findCommand(application, args[1]) orelse {
-        try stderr.print("error: unknown command '{s}'\n\n", .{args[1]});
+    const command = invocation.command orelse {
+        try stderr.print("error: unknown command '{s}'\n\n", .{invocation.command_token orelse ""});
         try cli.printApplicationHelp(allocator, stderr, application);
         return 1;
     };
 
-    const rest = args[2..];
-    if (cli.helpRequested(rest)) {
-        try cli.printCommandHelp(allocator, stdout, command);
-        return 0;
-    }
-
-    if (std.mem.eql(u8, command.name, "greet")) return runGreet(allocator, stdout, stderr, command, rest, environ);
-    if (std.mem.eql(u8, command.name, "cat")) return runCat(allocator, stdout, stderr, command, rest, environ);
-    if (std.mem.eql(u8, command.name, "complete")) return runComplete(allocator, stdout, stderr, command, rest, environ);
-    return runCompletion(allocator, stdout, stderr, command, rest, environ);
+    if (std.mem.eql(u8, command.spec.name, "greet")) return runGreet(stdout, &command.parsed);
+    if (std.mem.eql(u8, command.spec.name, "cat")) return runCat(stdout, &command.parsed);
+    if (std.mem.eql(u8, command.spec.name, "complete")) return runComplete(stdout, &command.parsed);
+    return runCompletion(stdout, stderr, &command.parsed);
 }
 
 fn runGreet(
-    allocator: std.mem.Allocator,
     stdout: anytype,
-    stderr: anytype,
-    spec: cli.CommandSpec,
-    args: []const [:0]const u8,
-    environ: *const std.process.Environ.Map,
+    parsed: *const cli.Parsed,
 ) !u8 {
-    const parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
-
     // --colour always is recorded under the canonical name "color".
     const color = parsed.getValue([]const u8, "color").?;
     const shout = parsed.present("shout") or std.mem.eql(u8, color, "always");
@@ -241,32 +239,18 @@ fn runGreet(
 }
 
 fn runCat(
-    allocator: std.mem.Allocator,
     stdout: anytype,
-    stderr: anytype,
-    spec: cli.CommandSpec,
-    args: []const [:0]const u8,
-    environ: *const std.process.Environ.Map,
+    parsed: *const cli.Parsed,
 ) !u8 {
-    var parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
-    // Not required here, since main uses an arena, but this is the form a
-    // caller with a general-purpose allocator would use.
-    defer parsed.deinit(allocator);
-
     if (parsed.getValue([]const u8, "ref")) |ref| try stdout.print("ref: {s}\n", .{ref});
     for (parsed.positionals.items) |path| try stdout.print("file: {s}\n", .{path});
     return 0;
 }
 
 fn runComplete(
-    allocator: std.mem.Allocator,
     stdout: anytype,
-    stderr: anytype,
-    spec: cli.CommandSpec,
-    args: []const [:0]const u8,
-    environ: *const std.process.Environ.Map,
+    parsed: *const cli.Parsed,
 ) !u8 {
-    const parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
     const prefix = if (parsed.positionals.items.len > 0) parsed.positionals.items[0] else "";
 
     // One candidate per line on stdout is the whole external-completer contract.
@@ -279,14 +263,10 @@ fn runComplete(
 }
 
 fn runCompletion(
-    allocator: std.mem.Allocator,
     stdout: anytype,
     stderr: anytype,
-    spec: cli.CommandSpec,
-    args: []const [:0]const u8,
-    environ: *const std.process.Environ.Map,
+    parsed: *const cli.Parsed,
 ) !u8 {
-    const parsed = try cli.parseCommand(allocator, stderr, args, spec, environ);
     const shell = parsed.positionals.items[0];
 
     if (std.mem.eql(u8, shell, "bash")) {

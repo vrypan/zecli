@@ -49,6 +49,10 @@ values, and environment values follow that same validation. For example, an
 `.int` value must be a valid `usize`, and a `.float` value must be a valid
 `f64`.
 
+`parseInvocation` applies this same resolution to application/root flags before
+parsing the selected command. Its v1 grammar accepts root options only before
+the command.
+
 ## Checked conversions
 
 Use `getValueAs` when a consumer needs a numeric representation other than the

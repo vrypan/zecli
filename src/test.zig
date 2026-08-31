@@ -410,6 +410,92 @@ test "Parsed.last: an explicit value overrides the declared default" {
     try testing.expectEqual(cli.ValueSource.command_line, result.flags.items[0].source);
 }
 
+test "Parsed.getValue: returns typed effective values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const specs = [_]cli.FlagSpec{
+        .{ .name = "name", .value = .string, .default_value = "world" },
+        .{ .name = "times", .value = .int, .default_value = "10" },
+        .{ .name = "offset", .value = .signed_int, .default_value = "-2" },
+        .{ .name = "ratio", .value = .float, .default_value = "0.75" },
+        .{ .name = "enabled", .value = .bool_required, .default_value = "yes" },
+    };
+    const result = try cli.parse(arena.allocator(), &.{}, &specs);
+
+    try testing.expectEqualStrings("world", result.getValue([]const u8, "name").?);
+    try testing.expectEqual(@as(usize, 10), result.getValue(usize, "times").?);
+    try testing.expectEqual(@as(i64, -2), result.getValue(i64, "offset").?);
+    try testing.expectApproxEqAbs(@as(f64, 0.75), result.getValue(f64, "ratio").?, 0.000001);
+    try testing.expect(result.getValue(bool, "enabled").?);
+}
+
+test "Parsed.getValue: converts integers with overflow checks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const specs = [_]cli.FlagSpec{.{ .name = "times", .value = .int }};
+    const args = [_][:0]const u8{ "--times", "300" };
+    const result = try cli.parse(arena.allocator(), &args, &specs);
+
+    try testing.expect(result.getValue(u64, "times") == null);
+    try testing.expectEqual(@as(u64, 300), (try result.getValueAs(u64, "times")).?);
+    try testing.expectError(error.IntegerOverflow, result.getValueAs(u8, "times"));
+    try testing.expectError(error.IncompatibleValueType, result.getValueAs(bool, "times"));
+}
+
+test "parse: accepts signed integer and float values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const specs = [_]cli.FlagSpec{
+        .{ .name = "offset", .value = .signed_int },
+        .{ .name = "ratio", .value = .float },
+    };
+    const args = [_][:0]const u8{ "--offset", "-42", "--ratio", "1.5" };
+    const result = try cli.parse(arena.allocator(), &args, &specs);
+
+    try testing.expectEqual(@as(i64, -42), result.getValue(i64, "offset").?);
+    try testing.expect(result.getValue(usize, "offset") == null);
+    try testing.expectApproxEqAbs(@as(f32, 1.5), (try result.getValueAs(f32, "ratio")).?, 0.000001);
+}
+
+test "Parsed.getValues: returns repeated values in command line order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const specs = [_]cli.FlagSpec{.{
+        .name = "item",
+        .value = .string,
+        .repeatable = true,
+        .default_value = "default-item",
+    }};
+    const args = [_][:0]const u8{ "--item", "apple", "--item", "orange" };
+    const result = try cli.parse(arena.allocator(), &args, &specs);
+    var items = result.getValues([]const u8, "item");
+
+    try testing.expectEqualStrings("apple", items.next().?);
+    try testing.expectEqualStrings("orange", items.next().?);
+    try testing.expect(items.next() == null);
+}
+
+test "Parsed.getValues: returns an omitted option's default once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const specs = [_]cli.FlagSpec{.{
+        .name = "item",
+        .value = .string,
+        .repeatable = true,
+        .default_value = "default-item",
+    }};
+    const result = try cli.parse(arena.allocator(), &.{}, &specs);
+    var items = result.getValues([]const u8, "item");
+
+    try testing.expectEqualStrings("default-item", items.next().?);
+    try testing.expect(items.next() == null);
+}
+
 test "Parsed.last: returns last occurrence for repeatable flag" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1026,6 +1112,16 @@ test "validateCommandSpec: rejects a default value outside the choices" {
         }},
     };
     try testing.expectError(error.DefaultNotInChoices, cli.validateCommandSpec(spec));
+}
+
+test "validateCommandSpec: rejects an invalid typed default" {
+    const spec = cli.CommandSpec{
+        .name = "c",
+        .description = "d",
+        .usage = "u",
+        .flags = &.{.{ .name = "ratio", .value = .float, .default_value = "many" }},
+    };
+    try testing.expectError(error.InvalidDefaultValue, cli.validateCommandSpec(spec));
 }
 
 // ── Help ─────────────────────────────────────────────────────────────────────

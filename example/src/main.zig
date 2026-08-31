@@ -218,11 +218,11 @@ fn runGreet(
     const parsed = try cli.parseCommand(allocator, stderr, args, spec);
 
     // --colour always is recorded under the canonical name "color".
-    const color = parsed.last("color").?;
+    const color = parsed.getValue([]const u8, "color").?;
     const shout = parsed.present("shout") or std.mem.eql(u8, color, "always");
 
-    const name = parsed.last("name").?;
-    const times = try std.fmt.parseInt(usize, parsed.last("times").?, 10);
+    const name = parsed.getValue([]const u8, "name").?;
+    const times = parsed.getValue(usize, "times").?;
 
     var i: usize = 0;
     while (i < times) : (i += 1) {
@@ -249,7 +249,7 @@ fn runCat(
     // caller with a general-purpose allocator would use.
     defer parsed.deinit(allocator);
 
-    if (parsed.last("ref")) |ref| try stdout.print("ref: {s}\n", .{ref});
+    if (parsed.getValue([]const u8, "ref")) |ref| try stdout.print("ref: {s}\n", .{ref});
     for (parsed.positionals.items) |path| try stdout.print("file: {s}\n", .{path});
     return 0;
 }

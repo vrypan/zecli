@@ -6,6 +6,8 @@ pub const ValueKind = enum {
     none,
     string,
     int,
+    signed_int,
+    float,
     bool_required,
     bool_optional,
 };
@@ -87,10 +89,26 @@ pub const ValueSource = enum {
     default,
 };
 
+pub const ParsedValue = union(enum) {
+    none,
+    string: []const u8,
+    int: usize,
+    signed_int: i64,
+    float: f64,
+    bool: bool,
+};
+
 pub const FlagValue = struct {
     name: []const u8,
     value: ?[]const u8 = null,
+    parsed_value: ParsedValue = .none,
     source: ValueSource = .command_line,
+};
+
+pub const GetValueAsError = error{
+    IncompatibleValueType,
+    IntegerOverflow,
+    UnsupportedValueType,
 };
 
 pub const Parsed = struct {
@@ -121,7 +139,90 @@ pub const Parsed = struct {
         }
         return null;
     }
+
+    /// Returns the final effective value when it has exactly type `T`, or null
+    /// when the option is absent or has a different value kind.
+    pub fn getValue(self: *const Parsed, comptime T: type, name: []const u8) ?T {
+        var i = self.flags.items.len;
+        while (i > 0) {
+            i -= 1;
+            const flag = self.flags.items[i];
+            if (!std.mem.eql(u8, flag.name, name)) continue;
+            return exactValue(T, flag.parsed_value);
+        }
+        return null;
+    }
+
+    /// Iterates over every effective value for a repeatable option in command
+    /// line order. An omitted option with a default yields that default once.
+    pub fn getValues(self: *const Parsed, comptime T: type, name: []const u8) ValueIterator(T) {
+        return .{ .parsed = self, .name = name };
+    }
+
+    /// Returns the final effective value converted to `T`, or null when the
+    /// option has no effective value. Numeric conversions are checked for
+    /// overflow.
+    pub fn getValueAs(self: *const Parsed, comptime T: type, name: []const u8) GetValueAsError!?T {
+        var i = self.flags.items.len;
+        while (i > 0) {
+            i -= 1;
+            const flag = self.flags.items[i];
+            if (!std.mem.eql(u8, flag.name, name)) continue;
+            return try convertValue(T, flag);
+        }
+        return null;
+    }
 };
+
+pub fn ValueIterator(comptime T: type) type {
+    return struct {
+        parsed: *const Parsed,
+        name: []const u8,
+        index: usize = 0,
+
+        pub fn next(self: *@This()) ?T {
+            while (self.index < self.parsed.flags.items.len) {
+                const flag = self.parsed.flags.items[self.index];
+                self.index += 1;
+                if (!std.mem.eql(u8, flag.name, self.name)) continue;
+                if (exactValue(T, flag.parsed_value)) |value| return value;
+            }
+            return null;
+        }
+    };
+}
+
+fn exactValue(comptime T: type, value: ParsedValue) ?T {
+    return switch (value) {
+        .string => |raw| if (T == []const u8) raw else null,
+        .int => |number| if (T == usize) number else null,
+        .signed_int => |number| if (T == i64) number else null,
+        .float => |number| if (T == f64) number else null,
+        .bool => |boolean| if (T == bool) boolean else null,
+        .none => null,
+    };
+}
+
+fn convertValue(comptime T: type, flag: FlagValue) GetValueAsError!T {
+    if (T == []const u8) return flag.value orelse return error.IncompatibleValueType;
+    if (T == bool) return switch (flag.parsed_value) {
+        .bool => |value| value,
+        else => error.IncompatibleValueType,
+    };
+
+    return switch (@typeInfo(T)) {
+        .int => switch (flag.parsed_value) {
+            .int => |value| std.math.cast(T, value) orelse error.IntegerOverflow,
+            .signed_int => |value| std.math.cast(T, value) orelse error.IntegerOverflow,
+            else => error.IncompatibleValueType,
+        },
+        .float => switch (flag.parsed_value) {
+            .float => |value| @floatCast(value),
+            else => error.IncompatibleValueType,
+        },
+        else => error.UnsupportedValueType,
+    };
+}
 
 // ── Lookup ───────────────────────────────────────────────────────────────────
 
@@ -190,6 +291,7 @@ pub const SpecError = error{
     CompletionWithoutValue,
     ConflictingCompletion,
     DefaultNotInChoices,
+    InvalidDefaultValue,
 };
 
 /// Command and long-option names use a conservative grammar that is safe in
@@ -225,8 +327,9 @@ fn validateFlags(flags: []const FlagSpec) SpecError!void {
             return error.ConflictingCompletion;
         }
 
-        if (flag.choices.len > 0) {
-            if (flag.default_value) |value| {
+        if (flag.default_value) |value| {
+            _ = parseDefaultValue(flag, value) catch return error.InvalidDefaultValue;
+            if (flag.choices.len > 0) {
                 if (!containsString(flag.choices, value)) return error.DefaultNotInChoices;
             }
         }
@@ -382,6 +485,7 @@ const ParseIssue = enum {
     unknown_option,
     missing_value,
     invalid_int,
+    invalid_float,
     invalid_bool,
     invalid_choice,
     unexpected_inline_value,
@@ -475,9 +579,11 @@ fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec
     for (specs) |spec| {
         const value = spec.default_value orelse continue;
         if (hasFlag(parsed, spec.name)) continue;
+        const parsed_value = try parseDefaultValue(spec, value);
         try parsed.flags.append(allocator, .{
             .name = spec.name,
             .value = value,
+            .parsed_value = parsed_value,
             .source = .default,
         });
     }
@@ -550,6 +656,11 @@ fn parseShort(
     try appendFlag(allocator, parsed, spec, value);
 }
 
+const ConsumedValue = struct {
+    raw: ?[]const u8,
+    parsed: ParsedValue,
+};
+
 fn consumeValue(
     args: []const [:0]const u8,
     index: *usize,
@@ -557,7 +668,7 @@ fn consumeValue(
     inline_value: ?[]const u8,
     token: []const u8,
     diagnostic: ?*ParseDiagnostic,
-) !?[]const u8 {
+) !ConsumedValue {
     switch (spec.value) {
         .none => {
             if (inline_value != null) {
@@ -568,9 +679,9 @@ fn consumeValue(
                 });
                 return error.InvalidArgument;
             }
-            return null;
+            return .{ .raw = null, .parsed = .none };
         },
-        .string, .int, .bool_required => {
+        .string, .int, .signed_int, .float, .bool_required => {
             const raw = inline_value orelse blk: {
                 index.* += 1;
                 if (index.* >= args.len) {
@@ -586,7 +697,7 @@ fn consumeValue(
             };
 
             if (spec.value == .int) {
-                _ = std.fmt.parseInt(usize, raw, 10) catch {
+                const value = std.fmt.parseInt(usize, raw, 10) catch {
                     setDiagnostic(diagnostic, .{
                         .issue = .invalid_int,
                         .token = token,
@@ -596,10 +707,42 @@ fn consumeValue(
                     });
                     return error.InvalidArgument;
                 };
+                try checkChoices(spec, raw, token, diagnostic);
+                return .{ .raw = raw, .parsed = .{ .int = value } };
+            }
+
+            if (spec.value == .signed_int) {
+                const value = std.fmt.parseInt(i64, raw, 10) catch {
+                    setDiagnostic(diagnostic, .{
+                        .issue = .invalid_int,
+                        .token = token,
+                        .flag_name = spec.name,
+                        .value = raw,
+                        .expected = getValueName(spec),
+                    });
+                    return error.InvalidArgument;
+                };
+                try checkChoices(spec, raw, token, diagnostic);
+                return .{ .raw = raw, .parsed = .{ .signed_int = value } };
+            }
+
+            if (spec.value == .float) {
+                const value = std.fmt.parseFloat(f64, raw) catch {
+                    setDiagnostic(diagnostic, .{
+                        .issue = .invalid_float,
+                        .token = token,
+                        .flag_name = spec.name,
+                        .value = raw,
+                        .expected = getValueName(spec),
+                    });
+                    return error.InvalidArgument;
+                };
+                try checkChoices(spec, raw, token, diagnostic);
+                return .{ .raw = raw, .parsed = .{ .float = value } };
             }
 
             if (spec.value == .bool_required) {
-                _ = parseBool(raw) catch {
+                const value = parseBool(raw) catch {
                     setDiagnostic(diagnostic, .{
                         .issue = .invalid_bool,
                         .token = token,
@@ -609,10 +752,12 @@ fn consumeValue(
                     });
                     return error.InvalidArgument;
                 };
+                try checkChoices(spec, raw, token, diagnostic);
+                return .{ .raw = raw, .parsed = .{ .bool = value } };
             }
 
             try checkChoices(spec, raw, token, diagnostic);
-            return raw;
+            return .{ .raw = raw, .parsed = .{ .string = raw } };
         },
         .bool_optional => {
             const raw = inline_value orelse blk: {
@@ -623,10 +768,10 @@ fn consumeValue(
                         break :blk next;
                     }
                 }
-                return "true";
+                break :blk "true";
             };
 
-            _ = parseBool(raw) catch {
+            const value = parseBool(raw) catch {
                 setDiagnostic(diagnostic, .{
                     .issue = .invalid_bool,
                     .token = token,
@@ -638,9 +783,20 @@ fn consumeValue(
             };
 
             try checkChoices(spec, raw, token, diagnostic);
-            return raw;
+            return .{ .raw = raw, .parsed = .{ .bool = value } };
         },
     }
+}
+
+fn parseDefaultValue(spec: FlagSpec, raw: []const u8) !ParsedValue {
+    return switch (spec.value) {
+        .none => error.InvalidArgument,
+        .string => .{ .string = raw },
+        .int => .{ .int = try std.fmt.parseInt(usize, raw, 10) },
+        .signed_int => .{ .signed_int = try std.fmt.parseInt(i64, raw, 10) },
+        .float => .{ .float = try std.fmt.parseFloat(f64, raw) },
+        .bool_required, .bool_optional => .{ .bool = try parseBool(raw) },
+    };
 }
 
 fn checkChoices(
@@ -661,18 +817,23 @@ fn checkChoices(
     return error.InvalidArgument;
 }
 
-fn appendFlag(allocator: Allocator, parsed: *Parsed, spec: FlagSpec, value: ?[]const u8) !void {
+fn appendFlag(allocator: Allocator, parsed: *Parsed, spec: FlagSpec, value: ConsumedValue) !void {
     // Values are always recorded under the canonical name, never under the
     // alias the caller happened to type.
     if (!spec.repeatable) {
         for (parsed.flags.items) |*item| {
             if (std.mem.eql(u8, item.name, spec.name)) {
-                item.value = value;
+                item.value = value.raw;
+                item.parsed_value = value.parsed;
                 return;
             }
         }
     }
-    try parsed.flags.append(allocator, .{ .name = spec.name, .value = value });
+    try parsed.flags.append(allocator, .{
+        .name = spec.name,
+        .value = value.raw,
+        .parsed_value = value.parsed,
+    });
 }
 
 fn validateArguments(
@@ -753,6 +914,10 @@ fn printParseError(writer: anytype, spec: CommandSpec, diagnostic: ParseDiagnost
         .invalid_int => try writer.print(
             "error: invalid value for '--{s}': expected {s}, got '{s}'\n",
             .{ flag_name, diagnostic.expected orelse "N", diagnostic.value orelse "" },
+        ),
+        .invalid_float => try writer.print(
+            "error: invalid value for '--{s}': expected {s}, got '{s}'\n",
+            .{ flag_name, diagnostic.expected orelse "NUMBER", diagnostic.value orelse "" },
         ),
         .invalid_bool => try writer.print(
             "error: invalid value for '--{s}': expected {s}, got '{s}'\n",
@@ -1023,7 +1188,7 @@ fn flagLabelLen(spec: FlagSpec) usize {
     len += switch (spec.value) {
         .none => 0,
         // " <NAME>"
-        .string, .int, .bool_required => 3 + getValueName(spec).len,
+        .string, .int, .signed_int, .float, .bool_required => 3 + getValueName(spec).len,
         // "[=NAME]"
         .bool_optional => 3 + getValueName(spec).len,
     };
@@ -1050,7 +1215,7 @@ fn writeFlagLabel(writer: anytype, spec: FlagSpec) !void {
     const value_name = getValueName(spec);
     switch (spec.value) {
         .none => {},
-        .string, .int, .bool_required => {
+        .string, .int, .signed_int, .float, .bool_required => {
             try writer.writeAll(" <");
             try writer.writeAll(value_name);
             try writer.writeByte('>');
@@ -1069,6 +1234,8 @@ pub fn getValueName(spec: FlagSpec) []const u8 {
         .none => "",
         .string => "VALUE",
         .int => "N",
+        .signed_int => "N",
+        .float => "NUMBER",
         .bool_required, .bool_optional => "BOOL",
     };
 }

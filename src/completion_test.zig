@@ -111,6 +111,16 @@ const odd_flags = [_]cli.FlagSpec{
     },
 };
 
+const wrap_arguments = [_]cli.ArgumentSpec{
+    .{
+        .name = "REF",
+        .description = "Reference to print",
+        .required = true,
+        .repeatable = true,
+        .completion = .files,
+    },
+};
+
 const commands = [_]cli.CommandSpec{
     .{
         .name = "grep",
@@ -126,6 +136,15 @@ const commands = [_]cli.CommandSpec{
         .description = "Print a file",
         .usage = "demo cat <FILE>...",
         .arguments = &cat_arguments,
+    },
+    .{
+        // Positional mode: operands after "--" complete like any other
+        // operand, rather than being an opaque tail for a wrapped program.
+        .name = "wrap",
+        .description = "Print references, -- included",
+        .usage = "demo wrap [options] <REF>...",
+        .arguments = &wrap_arguments,
+        .double_dash = .positionals,
     },
     .{
         .name = "run",
@@ -510,11 +529,59 @@ test "fish: counts positionals when slots complete differently" {
     var buffer = try generate(testing.allocator, .fish);
     defer buffer.deinit();
     try expectContains(buffer.items(), "function __demo_pos_run");
-    try expectContains(buffer.items(), "-eq 0'");
+    try expectContains(buffer.items(), "-eq 0; and not __demo_after_terminator'");
 }
 
 test "fish: applies a repeatable positional to every later slot" {
     var buffer = try generate(testing.allocator, .fish);
     defer buffer.deinit();
-    try expectContains(buffer.items(), "-ge 1'");
+    try expectContains(buffer.items(), "-ge 1; and not __demo_after_terminator'");
+}
+
+// ── Configurable "--" handling ───────────────────────────────────────────────
+//
+// "cat" keeps the default passthrough mode; "wrap" opts into positional mode.
+// Completion should stop after "--" for the former and keep completing
+// operands for the latter.
+
+test "bash: stops completing after -- for a passthrough command, not a positional one" {
+    var buffer = try generate(testing.allocator, .bash);
+    defer buffer.deinit();
+    const text = buffer.items();
+
+    const cat_fn = std.mem.indexOf(u8, text, "_demo__cmd_cat() {").?;
+    const wrap_fn = std.mem.indexOf(u8, text, "_demo__cmd_wrap() {").?;
+    const run_fn = std.mem.indexOf(u8, text, "_demo__cmd_run() {").?;
+    const cat_body = text[cat_fn..wrap_fn];
+    const wrap_body = text[wrap_fn..run_fn];
+
+    try expectContains(cat_body, "if [ \"$dd\" -eq 1 ]; then\n        COMPREPLY=()\n        return\n    fi");
+    try expectMissing(wrap_body, "if [ \"$dd\" -eq 1 ]; then\n        COMPREPLY=()\n        return\n    fi");
+}
+
+test "zsh: stops completing after -- for a passthrough command, not a positional one" {
+    var buffer = try generate(testing.allocator, .zsh);
+    defer buffer.deinit();
+    const text = buffer.items();
+
+    const cat_fn = std.mem.indexOf(u8, text, "_demo__cmd_cat() {").?;
+    const wrap_fn = std.mem.indexOf(u8, text, "_demo__cmd_wrap() {").?;
+    const run_fn = std.mem.indexOf(u8, text, "_demo__cmd_run() {").?;
+    const cat_body = text[cat_fn..wrap_fn];
+    const wrap_body = text[wrap_fn..run_fn];
+
+    try expectContains(cat_body, "${words[(I)--]}");
+    try expectMissing(wrap_body, "${words[(I)--]}");
+}
+
+test "fish: stops completing REF after -- for a passthrough command, not a positional one" {
+    var buffer = try generate(testing.allocator, .fish);
+    defer buffer.deinit();
+    const text = buffer.items();
+
+    // Both FILE and REF are single, required, file-completed arguments, so
+    // their positional completion lines are otherwise identical.
+    try expectContains(text, "_using_command cat show; and not __demo_after_terminator' -F");
+    try expectContains(text, "_using_command wrap' -F");
+    try expectMissing(text, "_using_command wrap; and not __demo_after_terminator' -F");
 }

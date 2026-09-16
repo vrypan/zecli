@@ -1898,3 +1898,181 @@ test "printCommandHelp: marks a repeatable option" {
     try cli.printCommandHelp(testing.allocator, &buffer, hist_spec);
     try testing.expect(std.mem.indexOf(u8, buffer.items(), "[repeatable]") != null);
 }
+
+// ── Configurable "--" handling ───────────────────────────────────────────────
+//
+// `cat_spec` mirrors the TJ grammar this feature exists for: a required,
+// repeatable REF operand, with `--` ending option parsing rather than
+// starting an opaque passthrough tail.
+
+const cat_double_dash_spec = cli.CommandSpec{
+    .name = "cat",
+    .description = "Print entries",
+    .usage = "tjctl cat [options] <REF>...",
+    .flags = &.{color_flag},
+    .arguments = &.{.{ .name = "REF", .required = true, .repeatable = true }},
+    .double_dash = .positionals,
+};
+
+test "parseCommand: positional mode satisfies a required argument entirely after --" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const args = [_][:0]const u8{ "--", "@42/out" };
+    const result = try cli.parseCommand(arena.allocator(), &buffer, &args, cat_double_dash_spec);
+
+    try testing.expectEqual(@as(usize, 1), result.positionals.items.len);
+    try testing.expectEqualStrings("@42/out", result.positionals.items[0]);
+    try testing.expect(!result.has_passthrough);
+}
+
+test "parseCommand: positional mode combines operands from both sides of --" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const args = [_][:0]const u8{ "@42/out", "--", "@43/out" };
+    const result = try cli.parseCommand(arena.allocator(), &buffer, &args, cat_double_dash_spec);
+
+    try testing.expectEqual(@as(usize, 2), result.positionals.items.len);
+    try testing.expectEqualStrings("@42/out", result.positionals.items[0]);
+    try testing.expectEqualStrings("@43/out", result.positionals.items[1]);
+}
+
+test "parseCommand: positional mode still requires at least one operand" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const args = [_][:0]const u8{"--"};
+    try testing.expectError(
+        error.ReportedCliError,
+        cli.parseCommand(arena.allocator(), &buffer, &args, cat_double_dash_spec),
+    );
+}
+
+test "parseCommand: positional mode preserves option-looking operands after --" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const args = [_][:0]const u8{ "--", "-pattern", "@42" };
+    const result = try cli.parseCommand(arena.allocator(), &buffer, &args, cat_double_dash_spec);
+
+    try testing.expectEqual(@as(usize, 2), result.positionals.items.len);
+    try testing.expectEqualStrings("-pattern", result.positionals.items[0]);
+    try testing.expectEqualStrings("@42", result.positionals.items[1]);
+}
+
+test "parseCommand: positional mode leaves a literal --help after the delimiter" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const args = [_][:0]const u8{ "@42", "--", "--help" };
+    const result = try cli.parseCommand(arena.allocator(), &buffer, &args, cat_double_dash_spec);
+
+    try testing.expectEqual(@as(usize, 2), result.positionals.items.len);
+    try testing.expectEqualStrings("--help", result.positionals.items[1]);
+    try testing.expect(!cli.helpRequested(&args));
+}
+
+test "parseCommand: positional mode leaves a second -- as a literal operand" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const args = [_][:0]const u8{ "--", "--" };
+    const result = try cli.parseCommand(arena.allocator(), &buffer, &args, cat_double_dash_spec);
+
+    try testing.expectEqual(@as(usize, 1), result.positionals.items.len);
+    try testing.expectEqualStrings("--", result.positionals.items[0]);
+}
+
+test "parseCommand: positional mode rejects excess operands past a fixed count" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const fixed_spec = cli.CommandSpec{
+        .name = "greet",
+        .description = "d",
+        .usage = "demo greet <NAME>",
+        .arguments = &.{.{ .name = "NAME", .required = true }},
+        .double_dash = .positionals,
+    };
+
+    const args = [_][:0]const u8{ "--", "alice", "bob" };
+    try testing.expectError(
+        error.ReportedCliError,
+        cli.parseCommand(arena.allocator(), &buffer, &args, fixed_spec),
+    );
+}
+
+test "parseCommand: positional mode accepts repeated operands split across --" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    const args = [_][:0]const u8{ "@1", "--", "", "-", "@2" };
+    const result = try cli.parseCommand(arena.allocator(), &buffer, &args, cat_double_dash_spec);
+
+    try testing.expectEqual(@as(usize, 4), result.positionals.items.len);
+    try testing.expectEqualStrings("@1", result.positionals.items[0]);
+    try testing.expectEqualStrings("", result.positionals.items[1]);
+    try testing.expectEqualStrings("-", result.positionals.items[2]);
+    try testing.expectEqualStrings("@2", result.positionals.items[3]);
+}
+
+test "parseCommand: passthrough remains the default and unaffected by positional mode" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    // grep_spec uses the default .passthrough mode: a required PATTERN cannot
+    // be satisfied from beyond the separator.
+    try testing.expectEqual(cli.DoubleDashMode.passthrough, grep_spec.double_dash);
+
+    const args = [_][:0]const u8{ "--", "@42/out" };
+    try testing.expectError(
+        error.ReportedCliError,
+        cli.parseCommand(arena.allocator(), &buffer, &args, grep_spec),
+    );
+}
+
+test "Invocation: positional mode combines operands across -- at the command level" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const application = cli.ApplicationSpec{
+        .name = "tjctl",
+        .description = "d",
+        .usage = "tjctl <command>",
+        .commands = &.{cat_double_dash_spec},
+    };
+
+    var invocation = try cli.Invocation.init(
+        arena.allocator(),
+        nw,
+        application,
+        &.{ "cat", "@1", "--", "@2" },
+        &empty_environ,
+    );
+    defer invocation.deinit(arena.allocator());
+
+    const command = invocation.getCommand().?;
+    try testing.expectEqual(@as(usize, 2), command.positionals().len);
+    try testing.expectEqualStrings("@1", command.positionals()[0]);
+    try testing.expectEqualStrings("@2", command.positionals()[1]);
+    try testing.expect(command.passthrough() == null);
+}

@@ -125,6 +125,9 @@ const commands = [_]cli.CommandSpec{
         .usage = "zecli-example cat [options] <FILE>...",
         .flags = &cat_flags,
         .arguments = &cat_arguments,
+        // Arguments after "--" are ordinary positionals, e.g. `cat -- -weird`,
+        // rather than an opaque passthrough tail for a wrapped command.
+        .double_dash = .positionals,
     },
     .{
         .name = "complete",

@@ -52,6 +52,16 @@ pub const ArgumentSpec = struct {
     completion: CompletionKind = .none,
 };
 
+/// How a command treats the arguments following a literal `--`.
+pub const DoubleDashMode = enum {
+    /// Everything after `--` is an opaque tail for a wrapped command. It does
+    /// not satisfy positional arguments; `Command.passthrough()` returns it.
+    passthrough,
+    /// Everything after `--` becomes ordinary positional arguments, combined
+    /// in order with any positionals given before the delimiter.
+    positionals,
+};
+
 pub const CommandSpec = struct {
     name: []const u8,
     aliases: []const []const u8 = &.{},
@@ -60,6 +70,7 @@ pub const CommandSpec = struct {
     flags: []const FlagSpec = &.{},
     arguments: []const ArgumentSpec = &.{},
     extra_help: ?[]const u8 = null,
+    double_dash: DoubleDashMode = .passthrough,
 };
 
 pub const ApplicationSpec = struct {
@@ -659,7 +670,7 @@ pub fn parseCommand(
     spec: CommandSpec,
 ) !Parsed {
     var diagnostic = ParseDiagnostic{};
-    var scope = parseScope(allocator, args, spec.flags, .complete, null, null, false, &diagnostic) catch |err| {
+    var scope = parseScope(allocator, args, spec.flags, .complete, null, null, false, spec.double_dash, &diagnostic) catch |err| {
         if (err != error.InvalidArgument) return err;
         try printParseError(writer, spec, diagnostic);
         return error.ReportedCliError;
@@ -696,6 +707,7 @@ fn initInvocation(
         .{ .prefix = application.prefix, .environ = environ },
         application,
         true,
+        .passthrough,
         &diagnostic,
     ) catch |err| {
         if (err != error.InvalidArgument) return err;
@@ -731,6 +743,7 @@ fn initInvocation(
         .{ .prefix = application.prefix, .environ = environ },
         null,
         true,
+        command_spec.double_dash,
         &diagnostic,
     ) catch |err| {
         if (err != error.InvalidArgument) return err;
@@ -760,7 +773,7 @@ fn initInvocation(
 }
 
 pub fn parse(allocator: Allocator, args: []const [:0]const u8, specs: []const FlagSpec) !Parsed {
-    const scope = try parseScope(allocator, args, specs, .complete, null, null, false, null);
+    const scope = try parseScope(allocator, args, specs, .complete, null, null, false, .passthrough, null);
     return scope.parsed;
 }
 
@@ -798,6 +811,7 @@ fn parseScope(
     resolution: ?Resolution,
     application: ?ApplicationSpec,
     allow_help: bool,
+    double_dash: DoubleDashMode,
     diagnostic: ?*ParseDiagnostic,
 ) !ScopeResult {
     var parsed = Parsed{};
@@ -818,8 +832,17 @@ fn parseScope(
         if (arg[1] == '-') {
             if (arg.len == 2) {
                 if (mode == .root) break;
-                parsed.has_passthrough = true;
-                try parsed.passthrough.appendSlice(allocator, args[i + 1 ..]);
+                switch (double_dash) {
+                    .passthrough => {
+                        parsed.has_passthrough = true;
+                        try parsed.passthrough.appendSlice(allocator, args[i + 1 ..]);
+                    },
+                    .positionals => {
+                        for (args[i + 1 ..]) |tail| {
+                            try parsed.positionals.append(allocator, tail);
+                        }
+                    },
+                }
                 break;
             }
             if (allow_help and std.mem.eql(u8, arg, "--help")) {

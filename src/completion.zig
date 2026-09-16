@@ -643,6 +643,13 @@ fn writeBashCommandFn(
     try writeBashFlagWordList(writer, command.flags);
     try writer.writeAll("\n            return\n        fi\n    fi\n\n");
 
+    // Passthrough commands hand everything after "--" to a wrapped program, so
+    // zecli offers nothing there; positional-mode commands keep completing the
+    // combined operand list, which $pos already counts across the boundary.
+    if (command.double_dash == .passthrough) {
+        try writer.writeAll("    if [ \"$dd\" -eq 1 ]; then\n        COMPREPLY=()\n        return\n    fi\n\n");
+    }
+
     try writeBashPositionals(writer, app, command);
     try writer.writeAll("}\n\n");
 }
@@ -827,7 +834,14 @@ fn writeZshCommandFn(
     command: cli.CommandSpec,
 ) !void {
     try writeCommandFnName(writer, app, command);
-    try writer.writeAll("() {\n    _arguments -S \\\n");
+    try writer.writeAll("() {\n");
+    // Passthrough commands hand everything after "--" to a wrapped program, so
+    // zecli offers nothing once it has been typed; positional-mode commands
+    // keep matching the argument specs below across the boundary.
+    if (command.double_dash == .passthrough) {
+        try writer.writeAll("    if (( ${words[(I)--]} )); then\n        return 1\n    fi\n");
+    }
+    try writer.writeAll("    _arguments -S \\\n");
     for (command.flags) |flag| {
         try writeZshFlag(writer, app, commandScope(command), flag, "        ");
     }
@@ -1311,7 +1325,7 @@ fn writeFishPositionals(
         if (kind == .none) return;
         try writer.writeAll("complete -c ");
         try writeFishQuoted(writer, app.name);
-        try writeFishCondition(writer, app, command, false);
+        try writeFishCondition(writer, app, command, command.double_dash == .passthrough);
         try writeFishValueAction(writer, app, kind, .{
             .command = command.name,
             .kind = .argument,
@@ -1340,7 +1354,13 @@ fn writeFishPositionals(
         try writeHelperPrefix(writer, app);
         try writer.writeAll("_pos_");
         try writeIdent(writer, command.name);
-        try writer.print(") -eq {d}'", .{i});
+        try writer.print(") -eq {d}", .{i});
+        if (command.double_dash == .passthrough) {
+            try writer.writeAll("; and not ");
+            try writeHelperPrefix(writer, app);
+            try writer.writeAll("_after_terminator");
+        }
+        try writer.writeByte('\'');
         try writeFishValueAction(writer, app, argument.completion, .{
             .command = command.name,
             .kind = .argument,
@@ -1365,7 +1385,13 @@ fn writeFishPositionals(
         try writeHelperPrefix(writer, app);
         try writer.writeAll("_pos_");
         try writeIdent(writer, command.name);
-        try writer.print(") -ge {d}'", .{command.arguments.len - 1});
+        try writer.print(") -ge {d}", .{command.arguments.len - 1});
+        if (command.double_dash == .passthrough) {
+            try writer.writeAll("; and not ");
+            try writeHelperPrefix(writer, app);
+            try writer.writeAll("_after_terminator");
+        }
+        try writer.writeByte('\'');
         try writeFishValueAction(writer, app, argument.completion, .{
             .command = command.name,
             .kind = .argument,

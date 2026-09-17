@@ -158,6 +158,16 @@ for `--help` after the selected command, including after root options. Help is
 generated from the specification, including aliases, choices, defaults, and
 repeatable markers.
 
+Help descriptions and option suffixes wrap to the current terminal width on
+Linux and macOS, with an 80-column fallback for redirected output, unavailable
+dimensions, and other platforms. No additional dependencies are required.
+Writers exposing a `file: std.Io.File` field use that file's terminal; other
+writers assume stdout. A custom writer can define `pub fn helpWidth(self: ...) usize`
+to override the width (zero selects the fallback), or call
+`cli.terminalWidth(file)` to query a different output file. In-memory writers can
+return a fixed width for reproducible output. Usage lines, labels, and
+`extra_help` retain their original formatting.
+
 ## Shell completion
 
 The same `ApplicationSpec` generates all three scripts:

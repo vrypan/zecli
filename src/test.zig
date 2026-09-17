@@ -1278,8 +1278,13 @@ const demo_app = cli.ApplicationSpec{
 // A writer that keeps output in memory, matching the interface the help
 // printers expect.
 const Buffer = struct {
+    width: usize = 80,
     allocator: std.mem.Allocator,
     bytes: std.ArrayList(u8) = .empty,
+
+    pub fn helpWidth(self: *const Buffer) usize {
+        return self.width;
+    }
 
     fn init(allocator: std.mem.Allocator) Buffer {
         return .{ .allocator = allocator };
@@ -2075,4 +2080,68 @@ test "Invocation: positional mode combines operands across -- at the command lev
     try testing.expectEqualStrings("@1", command.positionals()[0]);
     try testing.expectEqualStrings("@2", command.positionals()[1]);
     try testing.expect(command.passthrough() == null);
+}
+
+test "help wraps descriptions and suffixes at the writer width" {
+    const description = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+    for ([_]usize{ 32, 60, 160 }) |width| {
+        var buffer = Buffer.init(testing.allocator);
+        defer buffer.deinit();
+        buffer.width = width;
+        const spec = cli.CommandSpec{
+            .name = "c",
+            .description = description,
+            .usage = "c",
+            .arguments = &.{.{ .name = "ARG", .description = description }},
+            .flags = &.{.{
+                .name = "tag",
+                .description = description,
+                .value = .string,
+                .choices = &.{ "alpha", "beta", "gamma" },
+                .default_value = "alpha",
+                .repeatable = true,
+            }},
+        };
+        try cli.printCommandHelp(testing.allocator, &buffer, spec);
+        try cli.printCommandList(&buffer, &.{spec});
+        var lines = std.mem.splitScalar(u8, buffer.items(), '\n');
+        while (lines.next()) |line| try testing.expect(line.len <= width);
+        var compact: std.ArrayList(u8) = .empty;
+        defer compact.deinit(testing.allocator);
+        for (buffer.items()) |byte| {
+            if (byte != ' ' and byte != '\n') try compact.append(testing.allocator, byte);
+        }
+        try testing.expect(std.mem.indexOf(u8, compact.items, "[choices:alpha,beta,gamma][default:alpha][repeatable]") != null);
+        if (width == 160) try testing.expect(std.mem.startsWith(u8, buffer.items(), description));
+    }
+}
+
+test "help splits long words and treats zero width as the fallback" {
+    for ([_]usize{ 0, 1, 8, 80, 160 }) |requested_width| {
+        var buffer = Buffer.init(testing.allocator);
+        defer buffer.deinit();
+        buffer.width = requested_width;
+        const width = if (requested_width == 0) 80 else requested_width;
+        try cli.printApplicationHelp(testing.allocator, &buffer, .{
+            .name = "c",
+            .description = "x" ** 241,
+            .usage = "c",
+        });
+        const end = std.mem.indexOf(u8, buffer.items(), "\n\nUsage:").?;
+        var lines = std.mem.splitScalar(u8, buffer.items()[0..end], '\n');
+        var count: usize = 0;
+        while (lines.next()) |line| {
+            try testing.expect(line.len <= width);
+            count += line.len;
+        }
+        try testing.expectEqual(@as(usize, 241), count);
+    }
+}
+
+test "terminalWidth falls back when the query fails" {
+    // stdin under the test runner is not guaranteed to be a terminal; use an
+    // invalid handle to exercise a deterministic failed query instead.
+    if (@import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
+        try testing.expectEqual(@as(usize, 80), cli.terminalWidth(.{ .handle = -1, .flags = .{ .nonblocking = false } }));
+    }
 }

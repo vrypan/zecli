@@ -90,7 +90,66 @@ pub const help_flag = FlagSpec{
     .description = "Print help",
 };
 
-const help_line_width = 120;
+const default_help_line_width = 80;
+
+/// Query a file's current terminal width, falling back to 80 columns for
+/// non-terminals, unavailable dimensions, and unsupported platforms.
+/// Linux uses a direct syscall; macOS uses the OS-provided libSystem.
+pub fn terminalWidth(file: std.Io.File) usize {
+    var size: std.posix.winsize = undefined;
+    switch (@import("builtin").os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            while (true) {
+                const result = linux.ioctl(file.handle, linux.T.IOCGWINSZ, @intFromPtr(&size));
+                switch (linux.errno(result)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => return default_help_line_width,
+                }
+            }
+        },
+        .macos => {
+            while (true) {
+                const result = std.c.ioctl(file.handle, @as(c_int, @intCast(std.c.T.IOCGWINSZ)), &size);
+                switch (std.posix.errno(result)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => return default_help_line_width,
+                }
+            }
+        },
+        else => return default_help_line_width,
+    }
+    return if (size.col > 0) size.col else default_help_line_width;
+}
+
+// A custom writer may supply `helpWidth() usize`. Otherwise use its `file`
+// field when that is a std.Io.File, or assume stdout for opaque writers.
+fn helpWidth(writer: anytype) usize {
+    const T = switch (@typeInfo(@TypeOf(writer))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(writer),
+    };
+    switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => {
+            if (@hasDecl(T, "helpWidth")) {
+                const width = writer.helpWidth();
+                return if (width > 0) width else default_help_line_width;
+            }
+        },
+        else => {},
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => {
+            if (@hasField(T, "file")) {
+                if (@TypeOf(writer.file) == std.Io.File) return terminalWidth(writer.file);
+            }
+        },
+        else => {},
+    }
+    return terminalWidth(.stdout());
+}
 
 /// Stack space for the `[choices: ...]` and `[default: ...]` suffixes, past
 /// which `printOption` falls back to its allocator.
@@ -1320,18 +1379,20 @@ fn commandLabel(spec: CommandSpec) []const u8 {
 // ── Help ─────────────────────────────────────────────────────────────────────
 
 pub fn printApplicationHelp(allocator: Allocator, writer: anytype, application: ApplicationSpec) !void {
-    _ = try printWrapped(writer, application.description, 0, 0);
+    const width = helpWidth(writer);
+    _ = try printWrapped(writer, width, application.description, 0, 0);
     try writer.print("\n\nUsage: {s}\n", .{application.usage});
-    try printCommandList(writer, application.commands);
-    try printOptions(allocator, writer, application.flags, true);
+    try printCommandListWidth(writer, width, application.commands);
+    try printOptionsWidth(allocator, writer, width, application.flags, true);
     if (application.extra_help) |extra| try writer.print("\n{s}", .{extra});
 }
 
 pub fn printCommandHelp(allocator: Allocator, writer: anytype, spec: CommandSpec) !void {
-    _ = try printWrapped(writer, spec.description, 0, 0);
+    const width = helpWidth(writer);
+    _ = try printWrapped(writer, width, spec.description, 0, 0);
     try writer.print("\n\nUsage: {s}\n", .{spec.usage});
-    try printArguments(writer, spec.arguments);
-    try printOptions(allocator, writer, spec.flags, true);
+    try printArgumentsWidth(writer, width, spec.arguments);
+    try printOptionsWidth(allocator, writer, width, spec.flags, true);
     if (spec.extra_help) |extra| try writer.print("\n{s}", .{extra});
 }
 
@@ -1353,6 +1414,10 @@ fn writeCommandLabel(writer: anytype, spec: CommandSpec) !void {
 }
 
 pub fn printCommandList(writer: anytype, commands: []const CommandSpec) !void {
+    return printCommandListWidth(writer, helpWidth(writer), commands);
+}
+
+fn printCommandListWidth(writer: anytype, width: usize, commands: []const CommandSpec) !void {
     if (commands.len == 0) return;
 
     try writer.writeAll("\nCommands:\n");
@@ -1367,12 +1432,16 @@ pub fn printCommandList(writer: anytype, commands: []const CommandSpec) !void {
         try writeCommandLabel(writer, command);
         const description_col = max_label_len + 4;
         try writeSpaces(writer, max_label_len - commandLabelLen(command) + 2);
-        _ = try printWrapped(writer, command.description, description_col, description_col);
+        _ = try printWrapped(writer, width, command.description, description_col, description_col);
         try writer.writeByte('\n');
     }
 }
 
 pub fn printArguments(writer: anytype, arguments: []const ArgumentSpec) !void {
+    return printArgumentsWidth(writer, helpWidth(writer), arguments);
+}
+
+fn printArgumentsWidth(writer: anytype, width: usize, arguments: []const ArgumentSpec) !void {
     if (arguments.len == 0) return;
 
     try writer.writeAll("\nArguments:\n");
@@ -1386,7 +1455,7 @@ pub fn printArguments(writer: anytype, arguments: []const ArgumentSpec) !void {
         try writeArgumentLabel(writer, argument);
         const description_col = max_label_len + 4;
         try writeSpaces(writer, max_label_len - argumentLabelLen(argument) + 2);
-        _ = try printWrapped(writer, argument.description, description_col, description_col);
+        _ = try printWrapped(writer, width, argument.description, description_col, description_col);
         try writer.writeByte('\n');
     }
 }
@@ -1394,6 +1463,16 @@ pub fn printArguments(writer: anytype, arguments: []const ArgumentSpec) !void {
 pub fn printOptions(
     allocator: Allocator,
     writer: anytype,
+    flags: []const FlagSpec,
+    include_help: bool,
+) !void {
+    return printOptionsWidth(allocator, writer, helpWidth(writer), flags, include_help);
+}
+
+fn printOptionsWidth(
+    allocator: Allocator,
+    writer: anytype,
+    width: usize,
     flags: []const FlagSpec,
     include_help: bool,
 ) !void {
@@ -1410,17 +1489,18 @@ pub fn printOptions(
     }
 
     for (flags) |flag| {
-        try printOption(allocator, writer, flag, max_label_len);
+        try printOption(allocator, writer, width, flag, max_label_len);
     }
 
     if (include_help) {
-        try printOption(allocator, writer, help_flag, max_label_len);
+        try printOption(allocator, writer, width, help_flag, max_label_len);
     }
 }
 
 fn printOption(
     allocator: Allocator,
     writer: anytype,
+    width: usize,
     flag: FlagSpec,
     max_label_len: usize,
 ) !void {
@@ -1428,7 +1508,7 @@ fn printOption(
     const description_col = max_label_len + 2;
     try writeSpaces(writer, max_label_len - flagLabelLen(flag) + 2);
 
-    var line_len = try printWrapped(writer, flag.description, description_col, description_col);
+    var line_len = try printWrapped(writer, width, flag.description, description_col, description_col);
 
     // The suffixes have to be contiguous for printWrapped to break them on
     // word boundaries, but they are short: a stack buffer covers every
@@ -1445,23 +1525,24 @@ fn printOption(
             try buffer.appendSlice(suffix_allocator, choice);
         }
         try buffer.append(suffix_allocator, ']');
-        line_len = try printWrapped(writer, buffer.items, description_col, line_len);
+        line_len = try printWrapped(writer, width, buffer.items, description_col, line_len);
     }
 
     if (flag.default_value) |value| {
         const suffix = try std.fmt.allocPrint(suffix_allocator, "[default: {s}]", .{value});
         defer suffix_allocator.free(suffix);
-        line_len = try printWrapped(writer, suffix, description_col, line_len);
+        line_len = try printWrapped(writer, width, suffix, description_col, line_len);
     }
 
     if (flag.repeatable) {
-        _ = try printWrapped(writer, "[repeatable]", description_col, line_len);
+        _ = try printWrapped(writer, width, "[repeatable]", description_col, line_len);
     }
 
     try writer.writeByte('\n');
 }
 
-fn printWrapped(writer: anytype, text: []const u8, indent: usize, initial_line_len: usize) !usize {
+fn printWrapped(writer: anytype, width: usize, text: []const u8, requested_indent: usize, initial_line_len: usize) !usize {
+    const indent = @min(requested_indent, width - 1);
     var line_len = initial_line_len;
     var pos: usize = 0;
 
@@ -1478,8 +1559,8 @@ fn printWrapped(writer: anytype, text: []const u8, indent: usize, initial_line_l
         var remaining = word;
         while (remaining.len > 0) {
             const sep: usize = if (line_len == indent) 0 else 1;
-            const available = if (help_line_width > line_len + sep)
-                help_line_width - line_len - sep
+            const available = if (width > line_len + sep)
+                width - line_len - sep
             else
                 0;
 
@@ -1502,7 +1583,7 @@ fn printWrapped(writer: anytype, text: []const u8, indent: usize, initial_line_l
 
             const chunk_len = @min(
                 remaining.len,
-                if (help_line_width > indent) help_line_width - indent else 1,
+                if (width > indent) width - indent else 1,
             );
             try writer.writeAll(remaining[0..chunk_len]);
             line_len += chunk_len;

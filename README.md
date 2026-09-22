@@ -212,8 +212,11 @@ custom sections:
 ```
 
 Custom sections follow the built-in lists, then examples, then `extra_help`.
-Empty sections are omitted. Usage lines, labels, examples, and `extra_help`
-retain their original text and are not wrapped; caller-authored text should
+Empty sections are omitted. `extra_help` is prose, indented two spaces and
+wrapped to the help width, preserving explicit line breaks and blank paragraphs.
+It has no automatic heading; use a custom section when a title is useful.
+Usage lines, labels, and examples retain their original text and are not wrapped;
+caller-authored text should
 contain no ANSI escapes if plain output is required. Styling is added separately
 from text measurement, so it does not change wrapping or alignment.
 

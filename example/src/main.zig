@@ -153,6 +153,10 @@ const application = cli.comptimeValidated(.{
     .flags = &root_flags,
     .commands = &commands,
     .examples = &.{ "zecli-example greet --name Zig", "zecli-example cat README.md" },
+    .extra_help = "Run 'zecli-example <command> --help' for details about a command's options and arguments. " ++
+        "Command aliases work everywhere the full command name is accepted.\n\n" ++
+        "Try 'zecli-example completion bash' to generate a completion script for your shell. " ++
+        "Zsh and fish are also supported.",
 });
 
 const CommandName = cli.CommandEnum(application);

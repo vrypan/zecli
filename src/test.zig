@@ -2186,7 +2186,7 @@ test "styled help uses terminal palette and has identical plain layout" {
         try testing.expectEqualStrings(plain.items(), stripped.items());
         try testing.expect(std.mem.indexOf(u8, plain.items(), "  MODELS\n    system") != null);
         try testing.expect(std.mem.indexOf(u8, plain.items(), "  EXAMPLES\n    demo --tag alpha") != null);
-        try testing.expect(std.mem.endsWith(u8, plain.items(), spec.extra_help.?));
+        try testing.expect(std.mem.endsWith(u8, plain.items(), "\n  Caller-authored footer.\n"));
     }
 }
 
@@ -2201,4 +2201,30 @@ test "help styling policy honors overrides and defaults to plain without a termi
     try testing.expect(!cli.HelpStyle.auto.detect(testing.io, .stdout(), &env));
     try testing.expect(cli.HelpStyle.always.detect(testing.io, .stdout(), &env));
     try testing.expect(!cli.HelpStyle.never.detect(testing.io, .stdout(), &env));
+}
+
+test "extra help is indented and wrapped with explicit paragraph breaks" {
+    for ([_]bool{ false, true }) |application_help| {
+        for ([_][]const u8{ "alpha beta gamma delta\n\nNext line.", "alpha beta gamma delta\r\n\r\nNext line.\r\n" }) |extra| {
+            var buffer = Buffer.init(testing.allocator);
+            defer buffer.deinit();
+            buffer.width = 16;
+            if (application_help) {
+                try cli.printApplicationHelp(testing.allocator, &buffer, .{
+                    .name = "demo",
+                    .description = "",
+                    .usage = "demo",
+                    .extra_help = extra,
+                });
+            } else {
+                try cli.printCommandHelp(testing.allocator, &buffer, .{
+                    .name = "demo",
+                    .description = "",
+                    .usage = "demo",
+                    .extra_help = extra,
+                });
+            }
+            try testing.expect(std.mem.endsWith(u8, buffer.items(), "\n  alpha beta\n  gamma delta\n\n  Next line.\n"));
+        }
+    }
 }

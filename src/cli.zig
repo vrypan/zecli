@@ -1517,7 +1517,23 @@ fn printHelpExtras(writer: anytype, width: usize, spec: anytype) !void {
             try writer.writeByte('\n');
         }
     }
-    if (spec.extra_help) |extra| try writer.print("\n{s}", .{extra});
+    if (spec.extra_help) |extra| {
+        if (extra.len == 0) return;
+        try writer.writeByte('\n');
+        const indent = @min(2, width - 1);
+        var lines = std.mem.splitScalar(u8, extra, '\n');
+        while (lines.next()) |raw_line| {
+            // A trailing newline terminates the last line; it does not add
+            // another empty paragraph. Preserve all other explicit breaks.
+            if (raw_line.len == 0 and lines.peek() == null) break;
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len > 0) {
+                try writeSpaces(writer, indent);
+                _ = try printWrapped(writer, width, line, indent, indent);
+            }
+            try writer.writeByte('\n');
+        }
+    }
 }
 
 pub fn printApplicationHelp(allocator: Allocator, writer: anytype, application: ApplicationSpec) !void {

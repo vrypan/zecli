@@ -103,12 +103,17 @@ fn HelpWriter(comptime W: type) type {
     return struct {
         inner: W,
         styled: bool,
+        /// Maximum help width; zero wraps at the full available width.
+        max_width: usize = default_help_line_width,
         const Self = @This();
         pub fn helpStyle(self: Self) bool {
             return self.styled;
         }
         pub fn helpWidth(self: Self) usize {
-            return writerHelpWidth(self.inner);
+            return writerTerminalWidth(self.inner);
+        }
+        pub fn helpMaxWidth(self: Self) usize {
+            return self.max_width;
         }
         pub fn writeAll(self: Self, data: []const u8) !void {
             try self.inner.writeAll(data);
@@ -154,7 +159,7 @@ pub const help_flag = FlagSpec{
     .description = "Print help",
 };
 
-const default_help_line_width = 80;
+pub const default_help_line_width = 80;
 
 /// Query a file's current terminal width, falling back to 80 columns for
 /// non-terminals, unavailable dimensions, and unsupported platforms.
@@ -190,7 +195,7 @@ pub fn terminalWidth(file: std.Io.File) usize {
 
 // A custom writer may supply `helpWidth() usize`. Otherwise use its `file`
 // field when that is a std.Io.File, or assume stdout for opaque writers.
-fn writerHelpWidth(writer: anytype) usize {
+fn writerTerminalWidth(writer: anytype) usize {
     const T = switch (@typeInfo(@TypeOf(writer))) {
         .pointer => |pointer| pointer.child,
         else => @TypeOf(writer),
@@ -213,6 +218,23 @@ fn writerHelpWidth(writer: anytype) usize {
         else => {},
     }
     return terminalWidth(.stdout());
+}
+
+// Keep available terminal width separate from the application's wrapping cap.
+fn writerHelpWidth(writer: anytype) usize {
+    const width = writerTerminalWidth(writer);
+    const T = switch (@typeInfo(@TypeOf(writer))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(writer),
+    };
+    var limit: usize = default_help_line_width;
+    switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => {
+            if (@hasDecl(T, "helpMaxWidth")) limit = writer.helpMaxWidth();
+        },
+        else => {},
+    }
+    return if (limit == 0) width else @min(width, limit);
 }
 
 /// Stack space for the `[choices: ...]` and `[default: ...]` suffixes, past

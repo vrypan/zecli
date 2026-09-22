@@ -2112,7 +2112,10 @@ test "help wraps descriptions and suffixes at the writer width" {
             if (byte != ' ' and byte != '\n') try compact.append(testing.allocator, byte);
         }
         try testing.expect(std.mem.indexOf(u8, compact.items, "[choices:alpha,beta,gamma][default:alpha][repeatable]") != null);
-        if (width == 160) try testing.expect(std.mem.startsWith(u8, buffer.items(), "\n  " ++ description));
+        if (width == 160) {
+            var lines_at_default = std.mem.splitScalar(u8, buffer.items(), '\n');
+            while (lines_at_default.next()) |line| try testing.expect(line.len <= cli.default_help_line_width);
+        }
     }
 }
 
@@ -2225,6 +2228,38 @@ test "extra help is indented and wrapped with explicit paragraph breaks" {
                 });
             }
             try testing.expect(std.mem.endsWith(u8, buffer.items(), "\n  alpha beta\n  gamma delta\n\n  Next line.\n"));
+        }
+    }
+}
+
+test "help defaults to the width cap and zero uses the full available width" {
+    for ([_]usize{ 40, 160 }) |available| {
+        for ([_]usize{ cli.default_help_line_width, 0, 60 }) |limit| {
+            var buffer = Buffer.init(testing.allocator);
+            defer buffer.deinit();
+            buffer.width = available;
+            var output = cli.helpWriter(&buffer, false);
+            output.max_width = limit;
+            const description = "word " ** 30;
+            const spec = cli.ApplicationSpec{ .name = "demo", .description = description, .usage = "demo", .extra_help = description };
+            try cli.printApplicationHelp(testing.allocator, output, spec);
+            const expected_width = if (limit == 0) available else @min(available, limit);
+            var longest: usize = 0;
+            var lines = std.mem.splitScalar(u8, buffer.items(), '\n');
+            while (lines.next()) |line| {
+                try testing.expect(line.len <= expected_width);
+                longest = @max(longest, line.len);
+            }
+            // The repeated prose must use the selected width, not just stay
+            // below it due to an accidentally retained narrower cap.
+            try testing.expect(longest >= @min(151, expected_width - 4));
+            if (limit == cli.default_help_line_width) {
+                var plain = Buffer.init(testing.allocator);
+                defer plain.deinit();
+                plain.width = available;
+                try cli.printApplicationHelp(testing.allocator, &plain, spec);
+                try testing.expectEqualStrings(plain.items(), buffer.items());
+            }
         }
     }
 }

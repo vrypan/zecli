@@ -160,10 +160,11 @@ repeatable markers.
 
 Help uses uppercase section headings, indented rows, and aligned descriptions.
 Long labels move their descriptions onto the following line when there is too
-little room beside them. Descriptions and option suffixes wrap to the current
-terminal width on Linux and macOS, with an 80-column fallback for redirected
-output, unavailable dimensions, and other platforms. No additional dependencies
-are required.
+little room beside them. Wrapped help text defaults to at most
+`cli.default_help_line_width` (80 columns), or the terminal width if narrower.
+Terminal width detection supports Linux and macOS, with an 80-column fallback
+for redirected output, unavailable dimensions, and other platforms. No additional
+dependencies are required.
 
 To enable automatic terminal styling, wrap your output writer once using the
 actual destination file and your process's I/O and environment:
@@ -192,10 +193,24 @@ Unwrapped writers default to plain; custom writers may implement
 
 Writers exposing a `file: std.Io.File` field use that file's terminal width;
 other writers assume stdout for width only. A custom writer can define
-`pub fn helpWidth(self: ...) usize` to override width (zero selects the fallback),
+`pub fn helpWidth(self: ...) usize` to supply the available width (zero selects
+the fallback),
 or call `cli.terminalWidth(file)` to query a different output file. The
 `helpWriter` adapter preserves this behavior. In-memory writers can return a
 fixed width and use `cli.helpWriter(&buffer, true)` for styled snapshots.
+
+To use the full terminal width while keeping word wrapping, set the adapter's
+`max_width` to zero. A positive value sets a different cap:
+
+```zig
+var help_output = cli.helpWriter(writer, styled);
+help_output.max_width = 0;
+try cli.printApplicationHelp(allocator, help_output, application);
+```
+
+Custom writers can instead implement `pub fn helpMaxWidth(self: ...) usize`;
+zero means full available width, and the default cap is 80. When no terminal
+width is available, full-width mode still wraps at the 80-column fallback.
 
 Both application and command specifications support structured examples and
 custom sections:

@@ -158,15 +158,64 @@ for `--help` after the selected command, including after root options. Help is
 generated from the specification, including aliases, choices, defaults, and
 repeatable markers.
 
-Help descriptions and option suffixes wrap to the current terminal width on
-Linux and macOS, with an 80-column fallback for redirected output, unavailable
-dimensions, and other platforms. No additional dependencies are required.
-Writers exposing a `file: std.Io.File` field use that file's terminal; other
-writers assume stdout. A custom writer can define `pub fn helpWidth(self: ...) usize`
-to override the width (zero selects the fallback), or call
-`cli.terminalWidth(file)` to query a different output file. In-memory writers can
-return a fixed width for reproducible output. Usage lines, labels, and
-`extra_help` retain their original formatting.
+Help uses uppercase section headings, indented rows, and aligned descriptions.
+Long labels move their descriptions onto the following line when there is too
+little room beside them. Descriptions and option suffixes wrap to the current
+terminal width on Linux and macOS, with an 80-column fallback for redirected
+output, unavailable dimensions, and other platforms. No additional dependencies
+are required.
+
+To enable automatic terminal styling, wrap your output writer once using the
+actual destination file and your process's I/O and environment:
+
+```zig
+const help_output = cli.helpWriter(
+    writer,
+    cli.HelpStyle.auto.detect(init.io, .stdout(), init.environ_map),
+);
+if (try invocation.printHelpIfRequested(allocator, help_output)) return;
+```
+
+Use `.stderr()` instead if that is where the writer sends help. Automatic mode
+requires a terminal with ANSI support and a nonempty `TERM` other than `dumb`.
+Pipes, files, unknown capabilities, and a nonempty `NO_COLOR` produce plain
+text without escape sequences. `HelpStyle.always` and `.never` explicitly
+override automatic detection, including `NO_COLOR`. Zecli does not add a color
+command-line flag; applications can map their own preference to this policy.
+
+Headings use bold terminal cyan, labels use bold default foreground, and
+the opening description and annotations use dim default foreground. A blank line
+precedes the description. No RGB values, indexed extended colors,
+or background colors are used. Plain output preserves the same layout.
+Unwrapped writers default to plain; custom writers may implement
+`pub fn helpStyle(self: ...) bool` to supply a resolved styling decision.
+
+Writers exposing a `file: std.Io.File` field use that file's terminal width;
+other writers assume stdout for width only. A custom writer can define
+`pub fn helpWidth(self: ...) usize` to override width (zero selects the fallback),
+or call `cli.terminalWidth(file)` to query a different output file. The
+`helpWriter` adapter preserves this behavior. In-memory writers can return a
+fixed width and use `cli.helpWriter(&buffer, true)` for styled snapshots.
+
+Both application and command specifications support structured examples and
+custom sections:
+
+```zig
+.examples = &.{ "app respond 'Hello'", "app chat" },
+.help_sections = &.{.{
+    .title = "Models",
+    .entries = &.{.{
+        .name = "system",
+        .description = "On-device model (default)",
+    }},
+}},
+```
+
+Custom sections follow the built-in lists, then examples, then `extra_help`.
+Empty sections are omitted. Usage lines, labels, examples, and `extra_help`
+retain their original text and are not wrapped; caller-authored text should
+contain no ANSI escapes if plain output is required. Styling is added separately
+from text measurement, so it does not change wrapping or alignment.
 
 ## Shell completion
 

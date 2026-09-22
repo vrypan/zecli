@@ -152,6 +152,7 @@ const application = cli.comptimeValidated(.{
     .usage = "zecli-example [options] <command>",
     .flags = &root_flags,
     .commands = &commands,
+    .examples = &.{ "zecli-example greet --name Zig", "zecli-example cat README.md" },
 });
 
 const CommandName = cli.CommandEnum(application);
@@ -167,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
-    const stdout = FileWriter{ .file = .stdout() };
+    const stdout = cli.helpWriter(FileWriter{ .file = .stdout() }, cli.HelpStyle.auto.detect(init.io, .stdout(), init.environ_map));
     const stderr = FileWriter{ .file = .stderr() };
 
     const exit_code = run(allocator, stdout, stderr, args, init.environ_map) catch |err| {

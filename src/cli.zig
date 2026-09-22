@@ -62,6 +62,66 @@ pub const DoubleDashMode = enum {
     positionals,
 };
 
+/// Optional rows for application-specific help sections (for example MODELS).
+pub const HelpEntry = struct {
+    name: []const u8,
+    description: []const u8 = "",
+};
+
+pub const HelpSection = struct {
+    title: []const u8,
+    entries: []const HelpEntry,
+};
+
+/// Styling policy. Detection uses the actual output file, never stdin.
+pub const HelpStyle = enum {
+    auto,
+    always,
+    never,
+
+    pub fn detect(self: HelpStyle, io: std.Io, file: std.Io.File, environ: *const std.process.Environ.Map) bool {
+        switch (self) {
+            .always => return true,
+            .never => return false,
+            .auto => {},
+        }
+        if (environ.get("NO_COLOR")) |value| if (value.len != 0) return false;
+        const term = environ.get("TERM") orelse return false;
+        if (term.len == 0 or std.mem.eql(u8, term, "dumb")) return false;
+        if (!(file.isTty(io) catch false)) return false;
+        return file.supportsAnsiEscapeCodes(io) catch false;
+    }
+};
+
+/// Adapt a writer for help rendering. Resolve styling with HelpStyle.detect,
+/// or pass a fixed boolean for snapshots/custom destinations. No global I/O.
+pub fn helpWriter(writer: anytype, styled: bool) HelpWriter(@TypeOf(writer)) {
+    return .{ .inner = writer, .styled = styled };
+}
+
+fn HelpWriter(comptime W: type) type {
+    return struct {
+        inner: W,
+        styled: bool,
+        const Self = @This();
+        pub fn helpStyle(self: Self) bool {
+            return self.styled;
+        }
+        pub fn helpWidth(self: Self) usize {
+            return writerHelpWidth(self.inner);
+        }
+        pub fn writeAll(self: Self, data: []const u8) !void {
+            try self.inner.writeAll(data);
+        }
+        pub fn writeByte(self: Self, byte: u8) !void {
+            try self.inner.writeByte(byte);
+        }
+        pub fn print(self: Self, comptime fmt: []const u8, args: anytype) !void {
+            try self.inner.print(fmt, args);
+        }
+    };
+}
+
 pub const CommandSpec = struct {
     name: []const u8,
     aliases: []const []const u8 = &.{},
@@ -70,6 +130,8 @@ pub const CommandSpec = struct {
     flags: []const FlagSpec = &.{},
     arguments: []const ArgumentSpec = &.{},
     extra_help: ?[]const u8 = null,
+    examples: []const []const u8 = &.{},
+    help_sections: []const HelpSection = &.{},
     double_dash: DoubleDashMode = .passthrough,
 };
 
@@ -81,6 +143,8 @@ pub const ApplicationSpec = struct {
     flags: []const FlagSpec = &.{},
     commands: []const CommandSpec = &.{},
     extra_help: ?[]const u8 = null,
+    examples: []const []const u8 = &.{},
+    help_sections: []const HelpSection = &.{},
 };
 
 /// The help flag every generated help listing and completion script offers.
@@ -126,7 +190,7 @@ pub fn terminalWidth(file: std.Io.File) usize {
 
 // A custom writer may supply `helpWidth() usize`. Otherwise use its `file`
 // field when that is a std.Io.File, or assume stdout for opaque writers.
-fn helpWidth(writer: anytype) usize {
+fn writerHelpWidth(writer: anytype) usize {
     const T = switch (@typeInfo(@TypeOf(writer))) {
         .pointer => |pointer| pointer.child,
         else => @TypeOf(writer),
@@ -1378,22 +1442,110 @@ fn commandLabel(spec: CommandSpec) []const u8 {
 
 // ── Help ─────────────────────────────────────────────────────────────────────
 
+fn helpStyled(writer: anytype) bool {
+    const T = switch (@typeInfo(@TypeOf(writer))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(writer),
+    };
+    switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => {
+            if (@hasDecl(T, "helpStyle")) return writer.helpStyle();
+        },
+        else => {},
+    }
+    return false;
+}
+
+const Style = enum { heading, label, annotation, reset };
+
+fn style(writer: anytype, role: Style) !void {
+    if (!helpStyled(writer)) return;
+    try writer.writeAll(switch (role) {
+        .heading => "\x1b[1;36m",
+        .label => "\x1b[1m",
+        .annotation => "\x1b[2m",
+        .reset => "\x1b[0m",
+    });
+}
+
+fn heading(writer: anytype, title: []const u8) !void {
+    try writer.writeAll("\n  ");
+    try style(writer, .heading);
+    for (title) |byte| try writer.writeByte(std.ascii.toUpper(byte));
+    try style(writer, .reset);
+    try writer.writeByte('\n');
+}
+
+fn printHelpIntro(writer: anytype, width: usize, description: []const u8, usage: []const u8) !void {
+    if (description.len > 0) {
+        try writer.writeByte('\n');
+        const indent = @min(2, width - 1);
+        try writeSpaces(writer, indent);
+        try style(writer, .annotation);
+        _ = try printWrapped(writer, width, description, indent, indent);
+        try style(writer, .reset);
+        try writer.writeByte('\n');
+    }
+    try heading(writer, "USAGE");
+    try writer.writeAll("    ");
+    // Usage is caller-authored: preserve its text instead of parsing syntax.
+    try writer.writeAll(usage);
+    try writer.writeByte('\n');
+}
+
+fn printHelpExtras(writer: anytype, width: usize, spec: anytype) !void {
+    for (spec.help_sections) |section| {
+        if (section.entries.len == 0) continue;
+        try heading(writer, section.title);
+        var longest: usize = 0;
+        for (section.entries) |entry| longest = @max(longest, entry.name.len);
+        for (section.entries) |entry| {
+            try writer.writeAll("    ");
+            try style(writer, .label);
+            try writer.writeAll(entry.name);
+            try style(writer, .reset);
+            const col = try descriptionStart(writer, width, entry.name.len + 4, longest + 6);
+            _ = try printWrapped(writer, width, entry.description, col, col);
+            try writer.writeByte('\n');
+        }
+    }
+    if (spec.examples.len > 0) {
+        try heading(writer, "EXAMPLES");
+        for (spec.examples) |example| {
+            try writer.writeAll("    ");
+            try writer.writeAll(example);
+            try writer.writeByte('\n');
+        }
+    }
+    if (spec.extra_help) |extra| try writer.print("\n{s}", .{extra});
+}
+
 pub fn printApplicationHelp(allocator: Allocator, writer: anytype, application: ApplicationSpec) !void {
-    const width = helpWidth(writer);
-    _ = try printWrapped(writer, width, application.description, 0, 0);
-    try writer.print("\n\nUsage: {s}\n", .{application.usage});
+    const width = writerHelpWidth(writer);
+    try printHelpIntro(writer, width, application.description, application.usage);
     try printCommandListWidth(writer, width, application.commands);
     try printOptionsWidth(allocator, writer, width, application.flags, true);
-    if (application.extra_help) |extra| try writer.print("\n{s}", .{extra});
+    try printHelpExtras(writer, width, application);
 }
 
 pub fn printCommandHelp(allocator: Allocator, writer: anytype, spec: CommandSpec) !void {
-    const width = helpWidth(writer);
-    _ = try printWrapped(writer, width, spec.description, 0, 0);
-    try writer.print("\n\nUsage: {s}\n", .{spec.usage});
+    const width = writerHelpWidth(writer);
+    try printHelpIntro(writer, width, spec.description, spec.usage);
     try printArgumentsWidth(writer, width, spec.arguments);
     try printOptionsWidth(allocator, writer, width, spec.flags, true);
-    if (spec.extra_help) |extra| try writer.print("\n{s}", .{extra});
+    try printHelpExtras(writer, width, spec);
+}
+
+// Avoid leaving only a few columns for descriptions beside long labels.
+fn descriptionStart(writer: anytype, width: usize, label_end: usize, requested: usize) !usize {
+    if (requested >= width or width - requested < @min(20, width / 2)) {
+        const indent = @min(4, width - 1);
+        try writer.writeByte('\n');
+        try writeSpaces(writer, indent);
+        return indent;
+    }
+    try writeSpaces(writer, requested - label_end);
+    return requested;
 }
 
 /// Width of "name" or "name, alias, alias", computed without building it, so
@@ -1414,13 +1566,13 @@ fn writeCommandLabel(writer: anytype, spec: CommandSpec) !void {
 }
 
 pub fn printCommandList(writer: anytype, commands: []const CommandSpec) !void {
-    return printCommandListWidth(writer, helpWidth(writer), commands);
+    return printCommandListWidth(writer, writerHelpWidth(writer), commands);
 }
 
 fn printCommandListWidth(writer: anytype, width: usize, commands: []const CommandSpec) !void {
     if (commands.len == 0) return;
 
-    try writer.writeAll("\nCommands:\n");
+    try heading(writer, "COMMANDS");
 
     var max_label_len: usize = 0;
     for (commands) |command| {
@@ -1428,23 +1580,24 @@ fn printCommandListWidth(writer: anytype, width: usize, commands: []const Comman
     }
 
     for (commands) |command| {
-        try writer.writeAll("  ");
+        try writer.writeAll("    ");
+        try style(writer, .label);
         try writeCommandLabel(writer, command);
-        const description_col = max_label_len + 4;
-        try writeSpaces(writer, max_label_len - commandLabelLen(command) + 2);
+        try style(writer, .reset);
+        const description_col = try descriptionStart(writer, width, commandLabelLen(command) + 4, max_label_len + 6);
         _ = try printWrapped(writer, width, command.description, description_col, description_col);
         try writer.writeByte('\n');
     }
 }
 
 pub fn printArguments(writer: anytype, arguments: []const ArgumentSpec) !void {
-    return printArgumentsWidth(writer, helpWidth(writer), arguments);
+    return printArgumentsWidth(writer, writerHelpWidth(writer), arguments);
 }
 
 fn printArgumentsWidth(writer: anytype, width: usize, arguments: []const ArgumentSpec) !void {
     if (arguments.len == 0) return;
 
-    try writer.writeAll("\nArguments:\n");
+    try heading(writer, "ARGUMENTS");
 
     var max_label_len: usize = 0;
     for (arguments) |argument| {
@@ -1452,9 +1605,10 @@ fn printArgumentsWidth(writer: anytype, width: usize, arguments: []const Argumen
     }
 
     for (arguments) |argument| {
+        try style(writer, .label);
         try writeArgumentLabel(writer, argument);
-        const description_col = max_label_len + 4;
-        try writeSpaces(writer, max_label_len - argumentLabelLen(argument) + 2);
+        try style(writer, .reset);
+        const description_col = try descriptionStart(writer, width, argumentLabelLen(argument) + 4, max_label_len + 6);
         _ = try printWrapped(writer, width, argument.description, description_col, description_col);
         try writer.writeByte('\n');
     }
@@ -1466,7 +1620,7 @@ pub fn printOptions(
     flags: []const FlagSpec,
     include_help: bool,
 ) !void {
-    return printOptionsWidth(allocator, writer, helpWidth(writer), flags, include_help);
+    return printOptionsWidth(allocator, writer, writerHelpWidth(writer), flags, include_help);
 }
 
 fn printOptionsWidth(
@@ -1478,7 +1632,7 @@ fn printOptionsWidth(
 ) !void {
     if (flags.len == 0 and !include_help) return;
 
-    try writer.writeAll("\nOptions:\n");
+    try heading(writer, "OPTIONS");
 
     var max_label_len: usize = 0;
     for (flags) |flag| {
@@ -1504,9 +1658,10 @@ fn printOption(
     flag: FlagSpec,
     max_label_len: usize,
 ) !void {
+    try style(writer, .label);
     try writeFlagLabel(writer, flag);
-    const description_col = max_label_len + 2;
-    try writeSpaces(writer, max_label_len - flagLabelLen(flag) + 2);
+    try style(writer, .reset);
+    const description_col = try descriptionStart(writer, width, flagLabelLen(flag), max_label_len + 2);
 
     var line_len = try printWrapped(writer, width, flag.description, description_col, description_col);
 
@@ -1516,6 +1671,7 @@ fn printOption(
     var fallback = std.heap.stackFallback(suffix_stack_size, allocator);
     const suffix_allocator = fallback.get();
 
+    try style(writer, .annotation);
     if (flag.choices.len > 0) {
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(suffix_allocator);
@@ -1538,6 +1694,7 @@ fn printOption(
         _ = try printWrapped(writer, width, "[repeatable]", description_col, line_len);
     }
 
+    try style(writer, .reset);
     try writer.writeByte('\n');
 }
 
@@ -1600,12 +1757,12 @@ fn printWrapped(writer: anytype, width: usize, text: []const u8, requested_inden
     return line_len;
 }
 
-/// Renders "  -n, --name, --nom <TEXT>" for the option list.
+/// Renders "    -n, --name, --nom <TEXT>" for the option list.
 /// Width of an option label, computed without building it, so that the column
 /// measuring pass costs no allocation.
 fn flagLabelLen(spec: FlagSpec) usize {
-    // "  -s, " or the six spaces that stand in for a missing short option.
-    var len: usize = 6;
+    // "    -s, " or eight spaces that stand in for a missing short option.
+    var len: usize = 8;
     len += "--".len + spec.name.len;
     for (spec.aliases) |alias| len += ", --".len + alias.len;
     len += switch (spec.value) {
@@ -1621,11 +1778,11 @@ fn flagLabelLen(spec: FlagSpec) usize {
 /// Writes what `flagLabelLen` measures.
 fn writeFlagLabel(writer: anytype, spec: FlagSpec) !void {
     if (spec.short) |short| {
-        try writer.writeAll("  -");
+        try writer.writeAll("    -");
         try writer.writeByte(short);
         try writer.writeAll(", ");
     } else {
-        try writer.writeAll("      ");
+        try writer.writeAll("        ");
     }
 
     try writer.writeAll("--");
@@ -1670,7 +1827,7 @@ fn argumentLabelLen(argument: ArgumentSpec) usize {
 }
 
 fn writeArgumentLabel(writer: anytype, argument: ArgumentSpec) !void {
-    try writer.writeAll("  ");
+    try writer.writeAll("    ");
     if (argument.required) {
         try writer.print("<{s}>", .{argument.name});
     } else {

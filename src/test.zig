@@ -1082,7 +1082,7 @@ test "Invocation: prints application help once when requested in the root scope"
 
     try testing.expect(try invocation.printHelpIfRequested(arena.allocator(), &buffer));
     try testing.expect(invocation.getCommand() == null);
-    try testing.expect(std.mem.indexOf(u8, buffer.items(), "Usage: say [options] <command>") != null);
+    try testing.expect(std.mem.indexOf(u8, buffer.items(), "  USAGE\n    say [options] <command>") != null);
 }
 
 test "Invocation: prints command help after root flags and bypasses required arguments" {
@@ -1108,7 +1108,7 @@ test "Invocation: prints command help after root flags and bypasses required arg
 
     try testing.expect(invocation.getCommand() != null);
     try testing.expect(try invocation.printHelpIfRequested(arena.allocator(), &buffer));
-    try testing.expect(std.mem.indexOf(u8, buffer.items(), "Usage: say gm <MESSAGE>") != null);
+    try testing.expect(std.mem.indexOf(u8, buffer.items(), "  USAGE\n    say gm <MESSAGE>") != null);
 }
 
 test "Invocation: help after the separator remains a passthrough argument" {
@@ -2112,7 +2112,7 @@ test "help wraps descriptions and suffixes at the writer width" {
             if (byte != ' ' and byte != '\n') try compact.append(testing.allocator, byte);
         }
         try testing.expect(std.mem.indexOf(u8, compact.items, "[choices:alpha,beta,gamma][default:alpha][repeatable]") != null);
-        if (width == 160) try testing.expect(std.mem.startsWith(u8, buffer.items(), description));
+        if (width == 160) try testing.expect(std.mem.startsWith(u8, buffer.items(), "\n  " ++ description));
     }
 }
 
@@ -2127,12 +2127,12 @@ test "help splits long words and treats zero width as the fallback" {
             .description = "x" ** 241,
             .usage = "c",
         });
-        const end = std.mem.indexOf(u8, buffer.items(), "\n\nUsage:").?;
+        const end = std.mem.indexOf(u8, buffer.items(), "\n\n  USAGE").?;
         var lines = std.mem.splitScalar(u8, buffer.items()[0..end], '\n');
         var count: usize = 0;
         while (lines.next()) |line| {
             try testing.expect(line.len <= width);
-            count += line.len;
+            count += std.mem.count(u8, line, "x");
         }
         try testing.expectEqual(@as(usize, 241), count);
     }
@@ -2144,4 +2144,61 @@ test "terminalWidth falls back when the query fails" {
     if (@import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
         try testing.expectEqual(@as(usize, 80), cli.terminalWidth(.{ .handle = -1, .flags = .{ .nonblocking = false } }));
     }
+}
+
+test "styled help uses terminal palette and has identical plain layout" {
+    const spec = cli.CommandSpec{
+        .name = "demo",
+        .description = "A demo with help that wraps across multiple lines on narrow terminals.",
+        .usage = "demo [options]",
+        .flags = &.{.{ .name = "tag", .short = 't', .value = .string, .description = "Choose a tag to use", .default_value = "alpha", .choices = &.{ "alpha", "beta" }, .repeatable = true }},
+        .arguments = &.{.{ .name = "FILE", .description = "Input file" }},
+        .examples = &.{"demo --tag alpha"},
+        .help_sections = &.{.{ .title = "models", .entries = &.{.{ .name = "system", .description = "Built-in model" }} }},
+        .extra_help = "Caller-authored footer.\n",
+    };
+    for ([_]usize{ 32, 80 }) |width| {
+        var plain = Buffer.init(testing.allocator);
+        defer plain.deinit();
+        plain.width = width;
+        var rich = Buffer.init(testing.allocator);
+        defer rich.deinit();
+        rich.width = width;
+        try cli.printCommandHelp(testing.allocator, &plain, spec);
+        try cli.printCommandHelp(testing.allocator, cli.helpWriter(&rich, true), spec);
+        try testing.expect(std.mem.indexOfScalar(u8, plain.items(), 0x1b) == null);
+        try testing.expect(std.mem.indexOf(u8, rich.items(), "\x1b[1;36mUSAGE\x1b[0m") != null);
+        try testing.expect(std.mem.indexOf(u8, rich.items(), "\x1b[2m") != null);
+        var stripped = Buffer.init(testing.allocator);
+        defer stripped.deinit();
+        var i: usize = 0;
+        while (i < rich.items().len) {
+            if (rich.items()[i] == 0x1b) {
+                const end = std.mem.indexOfScalarPos(u8, rich.items(), i, 'm').? + 1;
+                const escape = rich.items()[i..end];
+                try testing.expect(std.mem.eql(u8, escape, "\x1b[1;36m") or std.mem.eql(u8, escape, "\x1b[1m") or std.mem.eql(u8, escape, "\x1b[2m") or std.mem.eql(u8, escape, "\x1b[0m"));
+                i = end;
+            } else {
+                try stripped.writeByte(rich.items()[i]);
+                i += 1;
+            }
+        }
+        try testing.expectEqualStrings(plain.items(), stripped.items());
+        try testing.expect(std.mem.indexOf(u8, plain.items(), "  MODELS\n    system") != null);
+        try testing.expect(std.mem.indexOf(u8, plain.items(), "  EXAMPLES\n    demo --tag alpha") != null);
+        try testing.expect(std.mem.endsWith(u8, plain.items(), spec.extra_help.?));
+    }
+}
+
+test "help styling policy honors overrides and defaults to plain without a terminal" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expect(!cli.HelpStyle.auto.detect(testing.io, .stdout(), &env));
+    try env.put("TERM", "dumb");
+    try testing.expect(!cli.HelpStyle.auto.detect(testing.io, .stdout(), &env));
+    try env.put("TERM", "xterm-256color");
+    try env.put("NO_COLOR", "1");
+    try testing.expect(!cli.HelpStyle.auto.detect(testing.io, .stdout(), &env));
+    try testing.expect(cli.HelpStyle.always.detect(testing.io, .stdout(), &env));
+    try testing.expect(!cli.HelpStyle.never.detect(testing.io, .stdout(), &env));
 }

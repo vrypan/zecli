@@ -31,6 +31,16 @@ const FileWriter = struct {
 
 const root_flags = [_]cli.FlagSpec{
     .{
+        // Metadata-only path flag for demonstrating file completion.
+        .name = "config",
+        .aliases = &.{"configuration"},
+        .short = 'c',
+        .value = .string,
+        .value_name = "FILE",
+        .description = "Config file path",
+        .completion = .files,
+    },
+    .{
         .name = "home",
         .value = .string,
         .value_name = "DIR",

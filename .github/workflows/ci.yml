@@ -34,7 +34,7 @@ jobs:
       - name: Check formatting
         run: |
           zig fmt --check src/cli.zig src/completion.zig src/test.zig \
-            src/completion_test.zig example/src/main.zig build.zig example/build.zig
+            src/completion_test.zig example/src/main.zig build.zig example/build.zig build.zig.zon
 
       - name: Check whitespace
         run: git diff --check
@@ -153,9 +153,22 @@ jobs:
       - name: Behavioral test (fish)
         working-directory: example
         run: |
+          # Fish may print invalid registration diagnostics and still exit 0.
+          fish --no-config -c 'source $argv[1]' "$RUNNER_TEMP/completion.fish" \
+            2> "$RUNNER_TEMP/fish-source.stderr"
+          if test -s "$RUNNER_TEMP/fish-source.stderr"; then
+            cat "$RUNNER_TEMP/fish-source.stderr"
+            exit 1
+          fi
           cat > "$RUNNER_TEMP/smoke.fish" <<'SCRIPT'
           source $argv[1]
           set -g fail 0
+
+          # The zecli002 prefix keeps matches independent of checkout files.
+          set -l fixture_dir (mktemp -d)
+          cd $fixture_dir
+          touch zecli002-file 'zecli002 spaced'
+          mkdir zecli002-dir
 
           function check
               set -l result (complete -C $argv[3] | string split -f1 \t)
@@ -189,10 +202,27 @@ jobs:
           refute "no options after --" --color 'zecli-example greet -- -'
           check "external candidate" "note with space" 'zecli-example cat --ref '
           check "external prefix" "@42/out" 'zecli-example cat --ref @4'
+          check "root file flag" zecli002-file 'zecli-example --config zecli002'
+          check "short file flag" zecli002-file 'zecli-example -c zecli002'
+          check "file flag alias" zecli002-file 'zecli-example --configuration zecli002'
+          check "inline file value" --config=zecli002-file 'zecli-example --config=zecli002'
+          check "file with spaces" 'zecli002 spaced' 'zecli-example --config zecli002'
+          refute "directory-only excludes files" zecli002-file 'zecli-example --home zecli002'
+          refute "choices exclude files" zecli002-file 'zecli-example greet --color zecli002'
+          check "positional files" zecli002-file 'zecli-example cat zecli002'
 
           exit $fail
           SCRIPT
-          PATH="$PWD/zig-out/bin:$PATH" fish "$RUNNER_TEMP/smoke.fish" "$RUNNER_TEMP/completion.fish"
+          if ! PATH="$PWD/zig-out/bin:$PATH" fish --no-config \
+            "$RUNNER_TEMP/smoke.fish" "$RUNNER_TEMP/completion.fish" \
+            2> "$RUNNER_TEMP/fish-behavior.stderr"; then
+            cat "$RUNNER_TEMP/fish-behavior.stderr"
+            exit 1
+          fi
+          if test -s "$RUNNER_TEMP/fish-behavior.stderr"; then
+            cat "$RUNNER_TEMP/fish-behavior.stderr"
+            exit 1
+          fi
 
       - name: Behavioral test (zsh)
         working-directory: example

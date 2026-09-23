@@ -39,6 +39,14 @@ const Buffer = struct {
 
 const root_flags = [_]cli.FlagSpec{
     .{
+        .name = "config",
+        .aliases = &.{"configuration"},
+        .short = 'c',
+        .value = .string,
+        .description = "Config file",
+        .completion = .files,
+    },
+    .{
         .name = "home",
         .short = 'H',
         .value = .string,
@@ -50,6 +58,19 @@ const root_flags = [_]cli.FlagSpec{
 };
 
 const grep_flags = [_]cli.FlagSpec{
+    .{
+        .name = "input",
+        .aliases = &.{"input-file"},
+        .short = 'i',
+        .value = .string,
+        .description = "Input file",
+        .completion = .files,
+    },
+    .{
+        .name = "program",
+        .value = .string,
+        .completion = .commands,
+    },
     .{
         .name = "color",
         .aliases = &.{"colour"},
@@ -199,6 +220,16 @@ fn expectMissing(text: []const u8, needle: []const u8) !void {
         std.debug.print("\nexpected not to find:\n{s}\n", .{needle});
         return error.TestUnexpectedContains;
     }
+}
+
+fn fishRegistration(text: []const u8, option: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "complete -c 'demo' ")) continue;
+        const long_pos = std.mem.indexOf(u8, line, " -l ") orelse continue;
+        if (std.mem.startsWith(u8, line[long_pos..], option)) return line;
+    }
+    return error.TestExpectedRegistration;
 }
 
 // ── Cross-shell structure ────────────────────────────────────────────────────
@@ -453,7 +484,9 @@ test "fish: locates the command after root options" {
     var buffer = try generate(testing.allocator, .fish);
     defer buffer.deinit();
     try expectContains(buffer.items(), "function __demo_command");
-    try expectContains(buffer.items(), "case '--home' '-H'");
+    try expectContains(buffer.items(), "'--home' '-H'");
+    try expectContains(buffer.items(), "'--config'");
+    try expectContains(buffer.items(), "'--configuration'");
     try expectContains(buffer.items(), "set skip 1");
     try expectContains(buffer.items(), "case '--*=*'");
 }
@@ -481,10 +514,25 @@ test "fish: applies a command's options to its aliases too" {
 test "fish: value-taking options take their value exclusively" {
     var buffer = try generate(testing.allocator, .fish);
     defer buffer.deinit();
-    // -x, not -r: -r alone lets fish add filenames to the declared values.
-    try expectContains(buffer.items(), "-l home -s H -x");
-    try expectContains(buffer.items(), "-l colour -x");
-    try expectMissing(buffer.items(), " -r ");
+    // Non-file providers stay exclusive so fish cannot add ordinary files.
+    for ([_][]const u8{ " -l home ", " -l color ", " -l colour ", " -l ref ", " -l program " }) |option| {
+        const line = try fishRegistration(buffer.items(), option);
+        try expectContains(line, " -x");
+        try expectMissing(line, " -r");
+    }
+}
+
+test "fish: file-valued flags require a parameter and enable files" {
+    var buffer = try generate(testing.allocator, .fish);
+    defer buffer.deinit();
+    for ([_][]const u8{ " -l config ", " -l configuration ", " -l input ", " -l input-file " }) |option| {
+        const line = try fishRegistration(buffer.items(), option);
+        try expectContains(line, " -r");
+        try expectContains(line, " -F");
+        try expectMissing(line, " -x");
+    }
+    try expectContains(try fishRegistration(buffer.items(), " -l config "), " -s c ");
+    try expectContains(try fishRegistration(buffer.items(), " -l input "), " -s i ");
 }
 
 test "bash: path helpers escape spaces and mark directories" {

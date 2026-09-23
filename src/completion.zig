@@ -1200,20 +1200,21 @@ fn writeFishFlag(
     flag: cli.FlagSpec,
     command: ?cli.CommandSpec,
 ) !void {
+    const kind = cli.flagCompletion(flag);
+    const parameter_option: []const u8 = if (!cli.takesValue(flag)) "" else if (kind == .files) " -r" else " -x";
     try writer.writeAll("complete -c ");
     try writeFishQuoted(writer, app.name);
     try writeFishCondition(writer, app, command, true);
     try writer.print(" -l {s}", .{flag.name});
     if (flag.short) |short| try writer.print(" -s {c}", .{short});
-    // -x, not -r: `require-parameter` still lets fish fall back to filenames
-    // alongside the declared values, so a directory-only flag would offer
-    // regular files. `exclusive` matches how bash and zsh complete values.
-    if (cli.takesValue(flag)) try writer.writeAll(" -x");
+    // File values require a parameter and enable Fish's file completion.
+    // Other values stay exclusive so Fish does not add ordinary filenames.
+    try writer.writeAll(parameter_option);
     if (flag.description.len > 0) {
         try writer.writeAll(" -d ");
         try writeFishQuoted(writer, flag.description);
     }
-    try writeFishValueAction(writer, app, cli.flagCompletion(flag), .{
+    try writeFishValueAction(writer, app, kind, .{
         .command = scope.name(),
         .kind = .flag,
         .name = flag.name,
@@ -1226,12 +1227,12 @@ fn writeFishFlag(
         try writeFishQuoted(writer, app.name);
         try writeFishCondition(writer, app, command, true);
         try writer.print(" -l {s}", .{alias});
-        if (cli.takesValue(flag)) try writer.writeAll(" -x");
+        try writer.writeAll(parameter_option);
         if (flag.description.len > 0) {
             try writer.writeAll(" -d ");
             try writeFishQuoted(writer, flag.description);
         }
-        try writeFishValueAction(writer, app, cli.flagCompletion(flag), .{
+        try writeFishValueAction(writer, app, kind, .{
             .command = scope.name(),
             .kind = .flag,
             .name = flag.name,

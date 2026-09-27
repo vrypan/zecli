@@ -2015,8 +2015,8 @@ fn printApplicationHelpAt(allocator: Allocator, writer: anytype, application: Ap
 fn printApplicationHelpContext(allocator: Allocator, writer: anytype, application: ApplicationSpec, rebase: ?HelpRebase) !void {
     const width = writerHelpWidth(writer);
     try printHelpIntro(writer, width, application.description, application.usage, rebase);
-    try printCommandListWidth(writer, width, application.commands);
-    try printOptionsWidth(allocator, writer, width, application.flags, true);
+    try printCommandList(writer, width, application.commands);
+    try printOptions(allocator, writer, width, application.flags);
     try printHelpExtras(writer, width, application, rebase);
 }
 
@@ -2043,8 +2043,8 @@ fn printCommandHelpAt(allocator: Allocator, writer: anytype, spec: CommandSpec, 
 fn printCommandHelpContext(allocator: Allocator, writer: anytype, spec: CommandSpec, rebase: ?HelpRebase) !void {
     const width = writerHelpWidth(writer);
     try printHelpIntro(writer, width, spec.description, spec.usage, rebase);
-    try printArgumentsWidth(writer, width, spec.arguments);
-    try printOptionsWidth(allocator, writer, width, spec.flags, true);
+    try printArguments(writer, width, spec.arguments);
+    try printOptions(allocator, writer, width, spec.flags);
     try printHelpExtras(writer, width, spec, rebase);
 }
 
@@ -2094,13 +2094,7 @@ fn writeCommandLabel(writer: anytype, spec: CommandSpec) !void {
     }
 }
 
-pub fn printCommandList(writer: anytype, commands: []const CommandSpec) !void {
-    var out = bufferedWriter(writer);
-    try printCommandListWidth(&out, writerHelpWidth(writer), commands);
-    try out.flush();
-}
-
-fn printCommandListWidth(writer: anytype, width: usize, commands: []const CommandSpec) !void {
+fn printCommandList(writer: anytype, width: usize, commands: []const CommandSpec) !void {
     if (commands.len == 0) return;
 
     try heading(writer, "COMMANDS");
@@ -2121,13 +2115,7 @@ fn printCommandListWidth(writer: anytype, width: usize, commands: []const Comman
     }
 }
 
-pub fn printArguments(writer: anytype, arguments: []const ArgumentSpec) !void {
-    var out = bufferedWriter(writer);
-    try printArgumentsWidth(&out, writerHelpWidth(writer), arguments);
-    try out.flush();
-}
-
-fn printArgumentsWidth(writer: anytype, width: usize, arguments: []const ArgumentSpec) !void {
+fn printArguments(writer: anytype, width: usize, arguments: []const ArgumentSpec) !void {
     if (arguments.len == 0) return;
 
     try heading(writer, "ARGUMENTS");
@@ -2148,43 +2136,19 @@ fn printArgumentsWidth(writer: anytype, width: usize, arguments: []const Argumen
     }
 }
 
-pub fn printOptions(
-    allocator: Allocator,
-    writer: anytype,
-    flags: []const FlagSpec,
-    include_help: bool,
-) !void {
-    var out = bufferedWriter(writer);
-    try printOptionsWidth(allocator, &out, writerHelpWidth(writer), flags, include_help);
-    try out.flush();
-}
-
-fn printOptionsWidth(
-    allocator: Allocator,
-    writer: anytype,
-    width: usize,
-    flags: []const FlagSpec,
-    include_help: bool,
-) !void {
-    if (flags.len == 0 and !include_help) return;
-
+/// Lists `flags` followed by the built-in help option.
+fn printOptions(allocator: Allocator, writer: anytype, width: usize, flags: []const FlagSpec) !void {
     try heading(writer, "OPTIONS");
 
-    var max_label_len: usize = 0;
+    var max_label_len = labelWidth(writeFlagLabel, help_flag);
     for (flags) |flag| {
         max_label_len = @max(max_label_len, labelWidth(writeFlagLabel, flag));
-    }
-    if (include_help) {
-        max_label_len = @max(max_label_len, labelWidth(writeFlagLabel, help_flag));
     }
 
     for (flags) |flag| {
         try printOption(allocator, writer, width, flag, max_label_len);
     }
-
-    if (include_help) {
-        try printOption(allocator, writer, width, help_flag, max_label_len);
-    }
+    try printOption(allocator, writer, width, help_flag, max_label_len);
 }
 
 fn printOption(

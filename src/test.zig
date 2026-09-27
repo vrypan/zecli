@@ -2578,7 +2578,12 @@ test "help wraps descriptions and suffixes at the writer width" {
             }},
         };
         try cli.printCommandHelp(testing.allocator, &buffer, spec);
-        try cli.printCommandList(&buffer, &.{spec});
+        try cli.printApplicationHelp(testing.allocator, &buffer, .{
+            .name = "app",
+            .description = description,
+            .usage = "app <command>",
+            .commands = &.{spec},
+        });
         var lines = std.mem.splitScalar(u8, buffer.items(), '\n');
         while (lines.next()) |line| try testing.expect(line.len <= width);
         var compact: std.ArrayList(u8) = .empty;

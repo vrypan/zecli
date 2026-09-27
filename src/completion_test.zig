@@ -277,6 +277,23 @@ test "mounted completion registers only the host and isolates reused helpers" {
     }
 }
 
+test "mounted bash and zsh completion call the host's shared helpers" {
+    var bash = try generateMounted(testing.allocator, .bash);
+    defer bash.deinit();
+    for ([_][]const u8{ "_words() {", "_files() {", "_dirs() {", "_commands() {", "_external() {" }) |helper| {
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bash.items(), helper));
+    }
+    try expectContains(bash.items(), "__host_words() {");
+    try expectMissing(bash.items(), "__host_mount_0_files() {");
+    // The mounted --store flag completes files through the host's helper.
+    try expectContains(bash.items(), "--store)\n            __host_files\n");
+
+    var zsh = try generateMounted(testing.allocator, .zsh);
+    defer zsh.deinit();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, zsh.items(), "_external() {"));
+    try expectContains(zsh.items(), "__host_external() {");
+}
+
 fn expectContains(text: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, text, needle) == null) {
         std.debug.print("\nexpected to find:\n{s}\n", .{needle});

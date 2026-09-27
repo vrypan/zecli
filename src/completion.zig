@@ -209,19 +209,22 @@ fn writeCommandFnName(writer: anytype, app: cli.ApplicationSpec, command: cli.Co
 
 /// Calls `body` once for every completion action in the specification, in a
 /// fixed order, so that helper definitions and their call sites always agree.
+/// `shared` names the script-wide helpers; see `writeBashScript`.
 fn forEachSlot(
     writer: anytype,
     app: cli.ApplicationSpec,
+    shared: cli.ApplicationSpec,
     comptime body: anytype,
 ) !void {
     for (app.flags) |flag| {
-        try body(writer, app, Slot{ .kind = .flag, .name = flag.name }, cli.flagCompletion(flag));
+        try body(writer, app, shared, Slot{ .kind = .flag, .name = flag.name }, cli.flagCompletion(flag));
     }
     for (app.commands) |command| {
         for (command.flags) |flag| {
             try body(
                 writer,
                 app,
+                shared,
                 Slot{ .command = command.name, .kind = .flag, .name = flag.name },
                 cli.flagCompletion(flag),
             );
@@ -230,6 +233,7 @@ fn forEachSlot(
             try body(
                 writer,
                 app,
+                shared,
                 Slot{ .command = command.name, .kind = .argument, .name = argument.name },
                 argument.completion,
             );
@@ -241,7 +245,7 @@ fn forEachSlot(
 
 pub fn generateBash(writer: anytype, app: cli.ApplicationSpec) !void {
     var out = cli.bufferedWriter(writer);
-    try writeBashScript(&out, app, true);
+    try writeBashScript(&out, app, null);
     try out.flush();
 }
 
@@ -255,13 +259,18 @@ fn mountedName(buffer: *[mounted_name_size]u8, parent: []const u8, index: usize)
     return std.fmt.bufPrint(buffer, "{s}-mount-{d}", .{ parent, index }) catch error.MountedNameTooLong;
 }
 
-fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !void {
+/// Writes the completion functions for `app`. `host` is null for the program
+/// itself, which defines the generic helpers (`_words`, `_files`, ...) once
+/// and registers the completion; mounted applications pass the host so they
+/// call its helpers instead of defining their own copies.
+fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, host: ?cli.ApplicationSpec) !void {
+    const shared = host orelse app;
     try writer.writeAll("# bash completion for ");
     try writer.writeAll(app.name);
     try writer.writeAll("\n\n");
 
-    try writeBashHelpers(writer, app);
-    try forEachSlot(writer, app, writePosixExternal);
+    if (host == null) try writeBashHelpers(writer, app);
+    try forEachSlot(writer, app, shared, writePosixExternal);
 
     // Main entry point: locate the command, then dispatch.
     try writePrefix(writer, app);
@@ -340,7 +349,7 @@ fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !v
         \\    case "$prev" in
         \\
     );
-    try writeBashValueDispatch(writer, app, rootScope(app), "        ");
+    try writeBashValueDispatch(writer, app, shared, rootScope(app), "        ");
     try writer.writeAll(
         \\    esac
         \\
@@ -348,18 +357,18 @@ fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !v
         \\
     );
     try writer.writeAll("        ");
-    try writeHelperPrefix(writer, app);
+    try writeHelperPrefix(writer, shared);
     try writer.writeAll("_words ");
     try writeBashFlagWordList(writer, app.flags);
     try writer.writeAll("\n        return\n    fi\n\n    ");
-    try writeHelperPrefix(writer, app);
+    try writeHelperPrefix(writer, shared);
     try writer.writeAll("_words ");
     try writeBashCommandWordList(writer, app.commands);
     try writer.writeAll("\n}\n\n");
 
-    for (app.commands) |command| try writeBashCommandFn(writer, app, command);
+    for (app.commands) |command| try writeBashCommandFn(writer, app, shared, command);
 
-    if (register) {
+    if (host == null) {
         try writer.writeAll("complete -F ");
         try writePrefix(writer, app);
         try writer.writeAll(" ");
@@ -372,7 +381,7 @@ fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !v
             const name = try mountedName(&name_buffer, app.name, index);
             var child = mounted.*;
             child.name = name;
-            try writeBashScript(writer, child, false);
+            try writeBashScript(writer, child, shared);
             try writeCommandFnName(writer, app, command);
             try writer.writeAll("() {\n    local -a zecli_words=( ");
             try writeQuoted(writer, name);
@@ -468,6 +477,7 @@ fn writeBashHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
 fn writePosixExternal(
     writer: anytype,
     app: cli.ApplicationSpec,
+    shared: cli.ApplicationSpec,
     slot: Slot,
     kind: cli.CompletionKind,
 ) anyerror!void {
@@ -477,7 +487,7 @@ fn writePosixExternal(
     };
     try writeExternalName(writer, app, slot);
     try writer.writeAll("() {\n    ");
-    try writeHelperPrefix(writer, app);
+    try writeHelperPrefix(writer, shared);
     try writer.writeAll("_external ");
     try writeQuoted(writer, external.executable);
     for (external.arguments) |argument| {
@@ -568,6 +578,7 @@ fn writeBashCommandPattern(writer: anytype, command: cli.CommandSpec) !void {
 fn writeBashValueDispatch(
     writer: anytype,
     app: cli.ApplicationSpec,
+    shared: cli.ApplicationSpec,
     scope: Scope,
     indent: []const u8,
 ) !void {
@@ -582,7 +593,7 @@ fn writeBashValueDispatch(
         try writer.writeAll(")\n");
         try writer.writeAll(indent);
         try writer.writeAll("    ");
-        try writeBashAction(writer, app, kind, .{
+        try writeBashAction(writer, app, shared, kind, .{
             .command = scope.name(),
             .kind = .flag,
             .name = flag.name,
@@ -598,25 +609,26 @@ fn writeBashValueDispatch(
 fn writeBashAction(
     writer: anytype,
     app: cli.ApplicationSpec,
+    shared: cli.ApplicationSpec,
     kind: cli.CompletionKind,
     slot: Slot,
 ) !void {
     switch (kind) {
         .none => try writer.writeAll("COMPREPLY=()"),
         .files => {
-            try writeHelperPrefix(writer, app);
+            try writeHelperPrefix(writer, shared);
             try writer.writeAll("_files");
         },
         .directories => {
-            try writeHelperPrefix(writer, app);
+            try writeHelperPrefix(writer, shared);
             try writer.writeAll("_dirs");
         },
         .commands => {
-            try writeHelperPrefix(writer, app);
+            try writeHelperPrefix(writer, shared);
             try writer.writeAll("_commands");
         },
         .values => |values| {
-            try writeHelperPrefix(writer, app);
+            try writeHelperPrefix(writer, shared);
             try writer.writeAll("_words ");
             try writeBashWordList(writer, values);
         },
@@ -667,6 +679,7 @@ fn writeBashCommandWordList(writer: anytype, commands: []const cli.CommandSpec) 
 fn writeBashCommandFn(
     writer: anytype,
     app: cli.ApplicationSpec,
+    shared: cli.ApplicationSpec,
     command: cli.CommandSpec,
 ) !void {
     try writeCommandFnName(writer, app, command);
@@ -708,14 +721,14 @@ fn writeBashCommandFn(
         \\        case "$prev" in
         \\
     );
-    try writeBashValueDispatch(writer, app, commandScope(command), "            ");
+    try writeBashValueDispatch(writer, app, shared, commandScope(command), "            ");
     try writer.writeAll(
         \\        esac
         \\        if [ "${cur:0:1}" = "-" ]; then
         \\
     );
     try writer.writeAll("            ");
-    try writeHelperPrefix(writer, app);
+    try writeHelperPrefix(writer, shared);
     try writer.writeAll("_words ");
     try writeBashFlagWordList(writer, command.flags);
     try writer.writeAll("\n            return\n        fi\n    fi\n\n");
@@ -727,13 +740,14 @@ fn writeBashCommandFn(
         try writer.writeAll("    if [ \"$dd\" -eq 1 ]; then\n        COMPREPLY=()\n        return\n    fi\n\n");
     }
 
-    try writeBashPositionals(writer, app, command);
+    try writeBashPositionals(writer, app, shared, command);
     try writer.writeAll("}\n\n");
 }
 
 fn writeBashPositionals(
     writer: anytype,
     app: cli.ApplicationSpec,
+    shared: cli.ApplicationSpec,
     command: cli.CommandSpec,
 ) !void {
     if (command.arguments.len == 0) {
@@ -743,7 +757,7 @@ fn writeBashPositionals(
 
     if (uniformArguments(command)) {
         try writer.writeAll("    ");
-        try writeBashAction(writer, app, command.arguments[0].completion, .{
+        try writeBashAction(writer, app, shared, command.arguments[0].completion, .{
             .command = command.name,
             .kind = .argument,
             .name = command.arguments[0].name,
@@ -756,7 +770,7 @@ fn writeBashPositionals(
     for (command.arguments, 0..) |argument, i| {
         if (argument.repeatable and i == command.arguments.len - 1) break;
         try writer.print("        {d})\n            ", .{i});
-        try writeBashAction(writer, app, argument.completion, .{
+        try writeBashAction(writer, app, shared, argument.completion, .{
             .command = command.name,
             .kind = .argument,
             .name = argument.name,
@@ -766,7 +780,7 @@ fn writeBashPositionals(
 
     try writer.writeAll("        *)\n            ");
     if (trailingArgument(command)) |argument| {
-        try writeBashAction(writer, app, argument.completion, .{
+        try writeBashAction(writer, app, shared, argument.completion, .{
             .command = command.name,
             .kind = .argument,
             .name = argument.name,
@@ -781,34 +795,39 @@ fn writeBashPositionals(
 
 pub fn generateZsh(writer: anytype, app: cli.ApplicationSpec) !void {
     var out = cli.bufferedWriter(writer);
-    try writeZshScript(&out, app, true);
+    try writeZshScript(&out, app, null);
     try out.flush();
 }
 
-fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !void {
+/// Like `writeBashScript`: only the program itself (`host` null) defines the
+/// shared `_external` helper and registers the completion.
+fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, host: ?cli.ApplicationSpec) !void {
+    const shared = host orelse app;
     try writer.writeAll("#compdef ");
     try writer.writeAll(app.name);
     try writer.writeAll("\n\n");
 
     // Reads one candidate per line from the completer's stdout; a nonzero exit
     // status or no output yields no candidates, and stderr is discarded.
-    try writeHelperPrefix(writer, app);
-    try writer.writeAll(
-        \\_external() {
-        \\    local output line
-        \\    local -a candidates
-        \\    output="$("$@" "$PREFIX" 2>/dev/null)" || return 1
-        \\    candidates=()
-        \\    for line in "${(@f)output}"; do
-        \\        [[ -n "$line" ]] && candidates+=("$line")
-        \\    done
-        \\    (( ${#candidates} )) || return 1
-        \\    compadd -- "${candidates[@]}"
-        \\}
-        \\
-        \\
-    );
-    try forEachSlot(writer, app, writePosixExternal);
+    if (host == null) {
+        try writeHelperPrefix(writer, app);
+        try writer.writeAll(
+            \\_external() {
+            \\    local output line
+            \\    local -a candidates
+            \\    output="$("$@" "$PREFIX" 2>/dev/null)" || return 1
+            \\    candidates=()
+            \\    for line in "${(@f)output}"; do
+            \\        [[ -n "$line" ]] && candidates+=("$line")
+            \\    done
+            \\    (( ${#candidates} )) || return 1
+            \\    compadd -- "${candidates[@]}"
+            \\}
+            \\
+            \\
+        );
+    }
+    try forEachSlot(writer, app, shared, writePosixExternal);
 
     for (app.commands) |command| try writeZshCommandFn(writer, app, command);
 
@@ -870,7 +889,7 @@ fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !vo
     // otherwise the first completion attempt defines the functions and
     // returns without completing anything. Sourced from a startup file,
     // funcstack is empty and the compdef registration is what's needed.
-    if (register) {
+    if (host == null) {
         try writer.writeAll("if [ \"${funcstack[1]}\" = \"_");
         try writer.writeAll(app.name);
         try writer.writeAll("\" ]; then\n    ");
@@ -887,7 +906,7 @@ fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !vo
             const name = try mountedName(&name_buffer, app.name, index);
             var child = mounted.*;
             child.name = name;
-            try writeZshScript(writer, child, false);
+            try writeZshScript(writer, child, shared);
             try writeCommandFnName(writer, app, command);
             try writer.writeAll("() {\n    local -a words=( ");
             try writeQuoted(writer, name);
@@ -1138,7 +1157,7 @@ fn writeFishScript(writer: anytype, app: cli.ApplicationSpec, target: FishTarget
 
     try writeFishCommandFn(writer, app, target);
     try writeFishHelpers(writer, app, target);
-    try forEachSlot(writer, app, writeFishHelper);
+    try forEachSlot(writer, app, app, writeFishHelper);
 
     // Root: commands and root options.
     for (app.commands) |command| {
@@ -1521,6 +1540,7 @@ fn writeFishValueAction(
 fn writeFishHelper(
     writer: anytype,
     app: cli.ApplicationSpec,
+    _: cli.ApplicationSpec,
     slot: Slot,
     kind: cli.CompletionKind,
 ) anyerror!void {

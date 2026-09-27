@@ -142,6 +142,14 @@ test "mount: validates conflicting metadata, descendants, and cycles" {
     try testing.expectError(error.CyclicMount, cli.validateApplicationSpec(cycle));
 }
 
+test "mount: printCommandHelp without a host path prints standalone help" {
+    var output = Buffer.init(testing.allocator);
+    defer output.deinit();
+    try cli.printCommandHelp(testing.allocator, &output, host_with_mount.commands[0]);
+    try testing.expect(std.mem.indexOf(u8, output.items(), "    inner [options] <command>") != null);
+    try testing.expect(std.mem.indexOf(u8, output.items(), "config [options]") == null);
+}
+
 test "mount: help and examples rebase only leading application names" {
     var output = Buffer.init(testing.allocator);
     defer output.deinit();

@@ -1958,9 +1958,12 @@ fn printApplicationHelpContext(allocator: Allocator, writer: anytype, applicatio
     try printHelpExtras(writer, width, application, rebase);
 }
 
+/// Prints help for one command. A mounted command prints its application's
+/// standalone help, since the host path is unknown here; `Command.printHelp`
+/// on a parsed invocation shows the full path instead.
 pub fn printCommandHelp(allocator: Allocator, writer: anytype, spec: CommandSpec) !void {
     if (spec.mounted_application) |application| {
-        return printApplicationHelpAt(allocator, writer, application.*, spec.name);
+        return printApplicationHelp(allocator, writer, application.*);
     }
     return printCommandHelpContext(allocator, writer, spec, null);
 }

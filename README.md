@@ -24,8 +24,8 @@ exe.root_module.addImport("completion", zecli.module("completion"));
 
 ## Define a CLI
 
-Describe your program with `ApplicationSpec`. It supports one level of
-subcommands.
+Describe your program with `ApplicationSpec`. Mount another application when a
+command needs its own commands.
 
 ```zig
 const greet_flags = [_]cli.FlagSpec{
@@ -90,13 +90,73 @@ fn run(allocator: std.mem.Allocator, stdout: anytype, stderr: anytype,
 ```
 
 `Invocation.init` prints a diagnostic and returns `error.ReportedCliError` for
-an invalid invocation. Its v1 grammar is
+an invalid invocation. Ordinary commands use
 `app [root options] <command> [command options]`; root options after the
 command are rejected. `getCommand()` returns `null` when no command was given.
 
 `CommandEnum` generates an enum from canonical command names. An alias resolves
 to its canonical tag. A command name that is not a Zig identifier is a quoted
 tag, such as `CommandName.@"good-morning"`.
+
+### Mounted applications
+
+Use `cli.mount` to put a complete application below a command. Its flags become
+options of that command, and its commands become the next level:
+
+```zig
+const config_commands = [_]cli.CommandSpec{ .{
+    .name = "set",
+    .description = "Set a value",
+    .usage = "config-tool set <KEY> <VALUE>",
+    .arguments = &.{
+        .{ .name = "KEY", .required = true },
+        .{ .name = "VALUE", .required = true },
+    },
+} };
+const config_app = cli.comptimeValidated(.{
+    .name = "config-tool",
+    .description = "Manage settings",
+    .usage = "config-tool <command>",
+    .commands = &config_commands,
+});
+const app = cli.comptimeValidated(.{
+    .name = "tool",
+    .description = "Tool",
+    .usage = "tool <command>",
+    .commands = &.{cli.mount("config", config_app)},
+});
+
+// After cli.Invocation.init(allocator, stderr, app, args[1..], environ):
+const group = invocation.getCommand().?;
+const action = group.getCommand() orelse {
+    try group.printHelp(allocator, stdout);
+    return;
+};
+switch (try action.as(cli.CommandEnum(config_app))) {
+    .set => try runSet(action),
+}
+```
+
+`tool config set key value` now parses all three scopes in one invocation.
+`Invocation.getCommand()` returns `config`; `config.getCommand()` returns `set`.
+Each level exposes only its own flags. A flag from an earlier level must appear
+before entering the next one. A mounted application may be reused under another
+name or contain further mounts. Change the wrapper's `aliases` field if the
+mount needs command aliases; the inner application's name is not an alias.
+
+Help and diagnostics use the full host path, such as `tool config set`. Usage
+lines and examples that begin with the standalone application name are rebased
+to that path. Other text is preserved. `group.printHelp()` prints mounted help
+when no child was selected; `tool config --help` and
+`tool config set --help` use `invocation.printHelpIfRequested()`.
+
+Each application's `prefix` governs environment values in its own root and
+ordinary commands. A mounted application's null prefix disables environment
+fallback at that level. Root `--` ends command selection; an ordinary leaf's
+`double_dash` controls its positional or passthrough behavior. The low-level
+`cli.parseCommand` returns a single `Parsed`, so use `Invocation.init` for a
+mounted command. Runtime-built specifications must keep referenced mounted
+applications alive and call `validateApplicationSpec` before parsing.
 
 Arguments after `--` are preserved separately for pass-through commands:
 
@@ -245,8 +305,10 @@ try completion.generateZsh(writer, application);
 try completion.generateFish(writer, application);
 ```
 
-Generated scripts handle commands, options, aliases, choices, files,
-directories, and external completers declared in the specification.
+Generated scripts handle commands, mounts, options, aliases, choices, files,
+directories, and external completers declared in the specification. One script
+for the host command covers every mounted path. External completers retain the
+executable and arguments declared in their specification.
 
 ## Release Notes
 

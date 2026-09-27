@@ -240,6 +240,14 @@ fn forEachSlot(
 // ── Bash ─────────────────────────────────────────────────────────────────────
 
 pub fn generateBash(writer: anytype, app: cli.ApplicationSpec) !void {
+    try writeBashScript(writer, app, true);
+}
+
+fn mountedName(parent: []const u8, index: usize) ![]u8 {
+    return std.fmt.allocPrint(std.heap.page_allocator, "{s}-mount-{d}", .{ parent, index });
+}
+
+fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !void {
     try writer.writeAll("# bash completion for ");
     try writer.writeAll(app.name);
     try writer.writeAll("\n\n");
@@ -287,7 +295,7 @@ pub fn generateBash(writer: anytype, app: cli.ApplicationSpec) !void {
         \\            --*=*) ;;
         \\
     );
-    try writeBashValueFlagCase(writer, app.flags, "            ");
+    try writeBashValueFlagCase(writer, app.flags, app.commands, "i", "            ");
     try writer.writeAll(
         \\            -*) ;;
         \\            *)
@@ -343,11 +351,30 @@ pub fn generateBash(writer: anytype, app: cli.ApplicationSpec) !void {
 
     for (app.commands) |command| try writeBashCommandFn(writer, app, command);
 
-    try writer.writeAll("complete -F ");
-    try writePrefix(writer, app);
-    try writer.writeAll(" ");
-    try writer.writeAll(app.name);
-    try writer.writeAll("\n");
+    if (register) {
+        try writer.writeAll("complete -F ");
+        try writePrefix(writer, app);
+        try writer.writeAll(" ");
+        try writer.writeAll(app.name);
+        try writer.writeAll("\n");
+    }
+    for (app.commands, 0..) |command, index| {
+        if (command.mounted_application) |mounted| {
+            const name = try mountedName(app.name, index);
+            defer std.heap.page_allocator.free(name);
+            var child = mounted.*;
+            child.name = name;
+            try writeBashScript(writer, child, false);
+            try writeCommandFnName(writer, app, command);
+            try writer.writeAll("() {\n    local -a zecli_words=( ");
+            try writeQuoted(writer, name);
+            try writer.writeAll(" \"${COMP_WORDS[@]:$((zecli_cmd_index+1))}\" )\n");
+            try writer.writeAll("    local COMP_CWORD=$((COMP_CWORD-zecli_cmd_index))\n");
+            try writer.writeAll("    local -a COMP_WORDS=( \"${zecli_words[@]}\" )\n    ");
+            try writePrefix(writer, child);
+            try writer.writeAll("\n}\n\n");
+        }
+    }
 }
 
 fn writeBashHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
@@ -452,24 +479,54 @@ fn writeBashExternal(
 
 /// Emits a `case` branch matching every spelling of every value-taking flag,
 /// so that the option's value is skipped when scanning for the command.
-fn writeBashValueFlagCase(writer: anytype, flags: []const cli.FlagSpec, indent: []const u8) !void {
+fn writeBashValueFlagCase(writer: anytype, flags: []const cli.FlagSpec, commands: ?[]const cli.CommandSpec, index: []const u8, indent: []const u8) !void {
     var any = false;
     for (flags) |flag| {
-        if (cli.takesValue(flag)) any = true;
+        if (cli.takesValue(flag) and flag.value != .bool_optional) any = true;
     }
-    if (!any) return;
-
-    try writer.writeAll(indent);
-    var first = true;
+    if (any) {
+        try writer.writeAll(indent);
+        var first = true;
+        for (flags) |flag| {
+            if (!cli.takesValue(flag) or flag.value == .bool_optional) continue;
+            try writeBashFlagPatterns(writer, flag, &first);
+        }
+        try writer.writeAll(")\n");
+        try writer.writeAll(indent);
+        try writer.writeAll("    skip=1\n");
+        try writer.writeAll(indent);
+        try writer.writeAll("    ;;\n");
+    }
     for (flags) |flag| {
-        if (!cli.takesValue(flag)) continue;
+        if (flag.value != .bool_optional) continue;
+        try writer.writeAll(indent);
+        var first = true;
         try writeBashFlagPatterns(writer, flag, &first);
+        try writer.writeAll(")\n");
+        try writer.writeAll(indent);
+        try writer.print("    case \"${{COMP_WORDS[{s}+1]-}}\" in\n", .{index});
+        try writer.writeAll(indent);
+        try writer.writeAll("        -*) skip=0 ;;\n");
+        if (commands) |specs| {
+            if (specs.len > 0) {
+                try writer.writeAll(indent);
+                try writer.writeAll("        ");
+                var first_command = true;
+                for (specs) |command| {
+                    if (!first_command) try writer.writeByte('|');
+                    first_command = false;
+                    try writeBashCommandPattern(writer, command);
+                }
+                try writer.writeAll(") skip=0 ;;\n");
+            }
+        }
+        try writer.writeAll(indent);
+        try writer.writeAll("        *) skip=1 ;;\n");
+        try writer.writeAll(indent);
+        try writer.writeAll("    esac\n");
+        try writer.writeAll(indent);
+        try writer.writeAll("    ;;\n");
     }
-    try writer.writeAll(")\n");
-    try writer.writeAll(indent);
-    try writer.writeAll("    skip=1\n");
-    try writer.writeAll(indent);
-    try writer.writeAll("    ;;\n");
 }
 
 fn writeBashFlagPatterns(writer: anytype, flag: cli.FlagSpec, first: *bool) !void {
@@ -619,7 +676,7 @@ fn writeBashCommandFn(
         \\            --*=*) ;;
         \\
     );
-    try writeBashValueFlagCase(writer, command.flags, "            ");
+    try writeBashValueFlagCase(writer, command.flags, null, "j", "            ");
     try writer.writeAll(
         \\            -*) ;;
         \\            *) pos=$((pos+1)) ;;
@@ -703,6 +760,10 @@ fn writeBashPositionals(
 // ── Zsh ──────────────────────────────────────────────────────────────────────
 
 pub fn generateZsh(writer: anytype, app: cli.ApplicationSpec) !void {
+    try writeZshScript(writer, app, true);
+}
+
+fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !void {
     try writer.writeAll("#compdef ");
     try writer.writeAll(app.name);
     try writer.writeAll("\n\n");
@@ -787,15 +848,32 @@ pub fn generateZsh(writer: anytype, app: cli.ApplicationSpec) !void {
     // otherwise the first completion attempt defines the functions and
     // returns without completing anything. Sourced from a startup file,
     // funcstack is empty and the compdef registration is what's needed.
-    try writer.writeAll("if [ \"${funcstack[1]}\" = \"_");
-    try writer.writeAll(app.name);
-    try writer.writeAll("\" ]; then\n    ");
-    try writePrefix(writer, app);
-    try writer.writeAll(" \"$@\"\nelse\n    compdef ");
-    try writePrefix(writer, app);
-    try writer.writeAll(" ");
-    try writer.writeAll(app.name);
-    try writer.writeAll("\nfi\n");
+    if (register) {
+        try writer.writeAll("if [ \"${funcstack[1]}\" = \"_");
+        try writer.writeAll(app.name);
+        try writer.writeAll("\" ]; then\n    ");
+        try writePrefix(writer, app);
+        try writer.writeAll(" \"$@\"\nelse\n    compdef ");
+        try writePrefix(writer, app);
+        try writer.writeAll(" ");
+        try writer.writeAll(app.name);
+        try writer.writeAll("\nfi\n");
+    }
+    for (app.commands, 0..) |command, index| {
+        if (command.mounted_application) |mounted| {
+            const name = try mountedName(app.name, index);
+            defer std.heap.page_allocator.free(name);
+            var child = mounted.*;
+            child.name = name;
+            try writeZshScript(writer, child, false);
+            try writeCommandFnName(writer, app, command);
+            try writer.writeAll("() {\n    local -a words=( ");
+            try writeQuoted(writer, name);
+            try writer.writeAll(" \"${words[@]:1}\" )\n    ");
+            try writePrefix(writer, child);
+            try writer.writeAll("\n}\n\n");
+        }
+    }
 }
 
 fn writeZshExternal(
@@ -879,7 +957,7 @@ fn writeZshFlag(
     try writer.writeAll("]");
 
     if (cli.takesValue(flag)) {
-        try writer.writeAll(":");
+        try writer.writeAll(if (flag.value == .bool_optional) "::" else ":");
         try writeZshDescription(writer, cli.getValueName(flag));
         try writer.writeAll(":");
         try writeZshAction(writer, app, cli.flagCompletion(flag), .{
@@ -1013,6 +1091,20 @@ fn writeZshValueWord(writer: anytype, value: []const u8) !void {
 // ── Fish ─────────────────────────────────────────────────────────────────────
 
 pub fn generateFish(writer: anytype, app: cli.ApplicationSpec) !void {
+    try writeFishScript(writer, app);
+    for (app.commands, 0..) |command, index| {
+        if (command.mounted_application) |mounted| {
+            const name = try mountedName(app.name, index);
+            defer std.heap.page_allocator.free(name);
+            var child = mounted.*;
+            child.name = name;
+            const ancestor = FishAncestor{ .app = app, .command = command };
+            try writeFishMounted(writer, child, app.name, &ancestor);
+        }
+    }
+}
+
+fn writeFishScript(writer: anytype, app: cli.ApplicationSpec) !void {
     try writer.writeAll("# fish completion for ");
     try writer.writeAll(app.name);
     try writer.writeAll("\n\n");
@@ -1048,6 +1140,169 @@ pub fn generateFish(writer: anytype, app: cli.ApplicationSpec) !void {
     }
 }
 
+const FishAncestor = struct {
+    app: cli.ApplicationSpec,
+    command: cli.CommandSpec,
+    parent: ?*const FishAncestor = null,
+};
+
+const FishBuffer = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *FishBuffer) void {
+        self.bytes.deinit(self.allocator);
+    }
+    pub fn writeAll(self: *FishBuffer, value: []const u8) !void {
+        try self.bytes.appendSlice(self.allocator, value);
+    }
+    pub fn writeByte(self: *FishBuffer, value: u8) !void {
+        try self.bytes.append(self.allocator, value);
+    }
+    pub fn print(self: *FishBuffer, comptime fmt: []const u8, args: anytype) !void {
+        const value = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(value);
+        try self.writeAll(value);
+    }
+};
+
+fn writeFishMounted(writer: anytype, app: cli.ApplicationSpec, host: []const u8, ancestors: *const FishAncestor) !void {
+    try writeFishMountedTokens(writer, app.name, ancestors);
+    var buffer = FishBuffer{ .allocator = std.heap.page_allocator };
+    defer buffer.deinit();
+    try writeFishScript(&buffer, app);
+
+    const registration = try std.fmt.allocPrint(std.heap.page_allocator, "complete -c '{s}'", .{app.name});
+    defer std.heap.page_allocator.free(registration);
+    var lines = std.mem.splitScalar(u8, buffer.bytes.items, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, registration)) {
+            const rest = line[registration.len..];
+            if (std.mem.eql(u8, rest, " -f")) continue;
+            try writer.writeAll("complete -c ");
+            try writeFishQuoted(writer, host);
+            if (std.mem.indexOf(u8, rest, " -n '")) |condition| {
+                try writer.writeAll(rest[0 .. condition + " -n '".len]);
+                try writeHelperPrefix(writer, app);
+                try writer.writeAll("_scope; and ");
+                try writer.writeAll(rest[condition + " -n '".len ..]);
+            } else {
+                try writer.writeAll(" -n '");
+                try writeHelperPrefix(writer, app);
+                try writer.writeAll("_scope'");
+                try writer.writeAll(rest);
+            }
+        } else if (std.mem.indexOf(u8, line, "(commandline -opc)")) |at| {
+            try writer.writeAll(line[0..at]);
+            try writer.writeAll("(");
+            try writeHelperPrefix(writer, app);
+            try writer.writeAll("_tokens)");
+            try writer.writeAll(line[at + "(commandline -opc)".len ..]);
+        } else {
+            try writer.writeAll(line);
+        }
+        try writer.writeByte('\n');
+    }
+
+    for (app.commands, 0..) |command, index| {
+        if (command.mounted_application) |mounted| {
+            const name = try mountedName(app.name, index);
+            defer std.heap.page_allocator.free(name);
+            var child = mounted.*;
+            child.name = name;
+            const ancestor = FishAncestor{ .app = app, .command = command, .parent = ancestors };
+            try writeFishMounted(writer, child, host, &ancestor);
+        }
+    }
+}
+
+fn writeFishMountedTokens(writer: anytype, name: []const u8, ancestors: *const FishAncestor) !void {
+    const app = cli.ApplicationSpec{ .name = name, .description = "", .usage = "" };
+    try writer.writeAll("function ");
+    try writeHelperPrefix(writer, app);
+    try writer.writeAll("_tokens\n    set -l tokens (commandline -opc)\n    set -e tokens[1]\n    set -l i 1\n");
+    try writeFishAncestorWalk(writer, ancestors);
+    try writer.writeAll("    echo ");
+    try writeFishQuoted(writer, name);
+    try writer.writeByte('\n');
+    try writer.writeAll(
+        \\    while test $i -le (count $tokens)
+        \\        printf '%s\n' $tokens[$i]
+        \\        set i (math $i + 1)
+        \\    end
+        \\end
+        \\
+    );
+    try writer.writeAll("function ");
+    try writeHelperPrefix(writer, app);
+    try writer.writeAll("_scope\n    ");
+    try writeHelperPrefix(writer, app);
+    try writer.writeAll("_tokens >/dev/null\nend\n\n");
+}
+
+fn writeFishAncestorWalk(writer: anytype, ancestor: *const FishAncestor) !void {
+    if (ancestor.parent) |parent| try writeFishAncestorWalk(writer, parent);
+    try writer.writeAll(
+        \\    set -l found 0
+        \\    while test $i -le (count $tokens)
+        \\        set -l token $tokens[$i]
+        \\        switch $token
+        \\            case '--'
+        \\                return 1
+        \\
+    );
+    for (ancestor.app.flags) |flag| {
+        if (!cli.takesValue(flag)) continue;
+        try writer.print("            case '--{s}'", .{flag.name});
+        for (flag.aliases) |alias| try writer.print(" '--{s}'", .{alias});
+        if (flag.short) |short| try writer.print(" '-{c}'", .{short});
+        try writer.writeByte('\n');
+        if (flag.value == .bool_optional) {
+            try writer.writeAll("                set i (math $i + 1)\n");
+            try writer.writeAll("                if test $i -le (count $tokens)\n                    set -l next $tokens[$i]\n                    if not contains -- $next");
+            try writer.writeByte(' ');
+            try writeFishQuoted(writer, ancestor.command.name);
+            for (ancestor.command.aliases) |alias| {
+                try writer.writeByte(' ');
+                try writeFishQuoted(writer, alias);
+            }
+            try writer.writeAll("; and not string match -q -- '-*' $next\n                        set i (math $i + 1)\n                    end\n                end\n                continue\n");
+        } else {
+            try writer.writeAll("                set i (math $i + 2)\n                continue\n");
+        }
+        if (flag.short != null and flag.attached_short_value) {
+            try writer.print("            case '-{c}*'\n                set i (math $i + 1)\n                continue\n", .{flag.short.?});
+        }
+    }
+    try writer.writeAll(
+        \\            case '--*=*' '-*'
+        \\                set i (math $i + 1)
+        \\                continue
+        \\            case '*'
+        \\                if not contains -- $token
+    );
+    try writer.writeByte(' ');
+    try writeFishQuoted(writer, ancestor.command.name);
+    for (ancestor.command.aliases) |alias| {
+        try writer.writeByte(' ');
+        try writeFishQuoted(writer, alias);
+    }
+    try writer.writeByte('\n');
+    try writer.writeAll(
+        \\                    return 1
+        \\                end
+        \\                set found 1
+        \\                set i (math $i + 1)
+        \\                break
+        \\        end
+        \\    end
+        \\    if test $found -eq 0
+        \\        return 1
+        \\    end
+        \\
+    );
+}
+
 /// Emits the function that reports which command the current command line
 /// names, skipping root options and the values they consume.
 fn writeFishCommandFn(writer: anytype, app: cli.ApplicationSpec) !void {
@@ -1063,12 +1318,16 @@ fn writeFishCommandFn(writer: anytype, app: cli.ApplicationSpec) !void {
         \\            set skip 0
         \\            continue
         \\        end
+    );
+    try writer.writeByte('\n');
+    try writeFishOptionalSkip(writer, app.commands);
+    try writer.writeAll(
         \\        switch $token
         \\            case '--'
         \\                return 1
         \\
     );
-    try writeFishValueFlagCase(writer, app.flags, "            ");
+    try writeFishValueFlagCase(writer, app.flags, "            ", 2);
     try writer.writeAll(
         \\            case '--*=*'
         \\            case '-*'
@@ -1125,26 +1384,55 @@ fn writeFishValueFlagCase(
     writer: anytype,
     flags: []const cli.FlagSpec,
     indent: []const u8,
+    optional_skip: usize,
 ) !void {
     var any = false;
     for (flags) |flag| {
-        if (cli.takesValue(flag)) any = true;
+        if (cli.takesValue(flag) and flag.value != .bool_optional) any = true;
     }
-    if (!any) return;
-
-    // Flag spellings use the validated name grammar, so they need no escaping
-    // beyond the surrounding quotes.
-    try writer.writeAll(indent);
-    try writer.writeAll("case");
+    if (any) {
+        // Flag spellings use the validated name grammar.
+        try writer.writeAll(indent);
+        try writer.writeAll("case");
+    }
     for (flags) |flag| {
-        if (!cli.takesValue(flag)) continue;
+        if (!cli.takesValue(flag) or flag.value == .bool_optional) continue;
         try writer.print(" '--{s}'", .{flag.name});
         for (flag.aliases) |alias| try writer.print(" '--{s}'", .{alias});
         if (flag.short) |short| try writer.print(" '-{c}'", .{short});
     }
-    try writer.writeAll("\n");
-    try writer.writeAll(indent);
-    try writer.writeAll("    set skip 1\n");
+    if (any) {
+        try writer.writeAll("\n");
+        try writer.writeAll(indent);
+        try writer.writeAll("    set skip 1\n");
+    }
+    for (flags) |flag| {
+        if (flag.value != .bool_optional) continue;
+        try writer.writeAll(indent);
+        try writer.writeAll("case");
+        try writer.print(" '--{s}'", .{flag.name});
+        for (flag.aliases) |alias| try writer.print(" '--{s}'", .{alias});
+        if (flag.short) |short| try writer.print(" '-{c}'", .{short});
+        try writer.writeByte('\n');
+        try writer.writeAll(indent);
+        try writer.print("    set skip {d}\n", .{optional_skip});
+    }
+}
+
+fn writeFishOptionalSkip(writer: anytype, commands: []const cli.CommandSpec) !void {
+    try writer.writeAll("        if test $skip -eq 2\n            set skip 0\n            if not string match -q -- '-*' $token");
+    if (commands.len > 0) {
+        try writer.writeAll("; and not contains -- $token");
+        for (commands) |command| {
+            try writer.writeByte(' ');
+            try writeFishQuoted(writer, command.name);
+            for (command.aliases) |alias| {
+                try writer.writeByte(' ');
+                try writeFishQuoted(writer, alias);
+            }
+        }
+    }
+    try writer.writeAll("\n                continue\n            end\n        end\n");
 }
 
 fn writeFishCommandEntry(
@@ -1201,7 +1489,7 @@ fn writeFishFlag(
     command: ?cli.CommandSpec,
 ) !void {
     const kind = cli.flagCompletion(flag);
-    const parameter_option: []const u8 = if (!cli.takesValue(flag)) "" else if (kind == .files) " -r" else " -x";
+    const parameter_option: []const u8 = if (!cli.takesValue(flag) or flag.value == .bool_optional) "" else if (kind == .files) " -r" else " -x";
     try writer.writeAll("complete -c ");
     try writeFishQuoted(writer, app.name);
     try writeFishCondition(writer, app, command, true);
@@ -1424,11 +1712,15 @@ fn writeFishPositionalCounter(
         \\            set skip 0
         \\            continue
         \\        end
+    );
+    try writer.writeByte('\n');
+    try writeFishOptionalSkip(writer, app.commands);
+    try writer.writeAll(
         \\        if test $found -eq 0
         \\            switch $token
         \\
     );
-    try writeFishValueFlagCase(writer, app.flags, "                ");
+    try writeFishValueFlagCase(writer, app.flags, "                ", 2);
     try writer.writeAll(
         \\                case '--*=*'
         \\                case '-*'
@@ -1446,7 +1738,7 @@ fn writeFishPositionalCounter(
         \\                set dd 1
         \\
     );
-    try writeFishValueFlagCase(writer, command.flags, "            ");
+    try writeFishValueFlagCase(writer, command.flags, "            ", 1);
     try writer.writeAll(
         \\            case '--*=*'
         \\            case '-*'

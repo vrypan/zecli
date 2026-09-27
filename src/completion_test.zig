@@ -208,6 +208,75 @@ fn generate(allocator: std.mem.Allocator, shell: Shell) !Buffer {
     return buffer;
 }
 
+const mounted_leaf_app = cli.comptimeValidated(.{
+    .name = "leaf-tool",
+    .description = "Nested tools",
+    .usage = "leaf-tool <command>",
+    .flags = &.{.{ .name = "store", .value = .string, .completion = .files }},
+    .commands = &.{.{
+        .name = "set",
+        .aliases = &.{"put"},
+        .description = "Set a value",
+        .usage = "leaf-tool set <VALUE>",
+        .flags = &.{.{
+            .name = "mode",
+            .value = .string,
+            .choices = &.{ "local", "shared" },
+        }},
+        .arguments = &.{.{ .name = "VALUE", .required = true, .completion = .files }},
+    }},
+});
+
+const mounted_host_app = cli.comptimeValidated(.{
+    .name = "host",
+    .description = "Host",
+    .usage = "host <command>",
+    .commands = &.{
+        cli.mount("alpha", mounted_leaf_app),
+        cli.mount("beta", mounted_leaf_app),
+    },
+});
+
+fn generateMounted(allocator: std.mem.Allocator, shell: Shell) !Buffer {
+    var buffer = Buffer.init(allocator);
+    errdefer buffer.deinit();
+    switch (shell) {
+        .bash => try completion.generateBash(&buffer, mounted_host_app),
+        .zsh => try completion.generateZsh(&buffer, mounted_host_app),
+        .fish => try completion.generateFish(&buffer, mounted_host_app),
+    }
+    return buffer;
+}
+
+test "mounted completion registers only the host and isolates reused helpers" {
+    for ([_]Shell{ .bash, .zsh, .fish }) |shell| {
+        var buffer = try generateMounted(testing.allocator, shell);
+        defer buffer.deinit();
+        const output = buffer.items();
+        try expectContains(output, "alpha");
+        try expectContains(output, "beta");
+        try expectContains(output, "local");
+        try expectContains(output, "shared");
+        try expectContains(output, "host_mount_0");
+        try expectContains(output, "host_mount_1");
+        switch (shell) {
+            .bash => {
+                try expectContains(output, "complete -F _host host\n");
+                try expectMissing(output, "complete -F _host_mount_0");
+            },
+            .zsh => {
+                try expectContains(output, "compdef _host host\n");
+                try expectMissing(output, "compdef _host_mount_0");
+            },
+            .fish => {
+                try expectContains(output, "complete -c 'host'");
+                try expectMissing(output, "complete -c 'host-mount-0'");
+                try expectContains(output, "_scope; and");
+            },
+        }
+    }
+}
+
 fn expectContains(text: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, text, needle) == null) {
         std.debug.print("\nexpected to find:\n{s}\n", .{needle});

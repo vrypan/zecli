@@ -138,6 +138,7 @@ pub const CommandSpec = struct {
     examples: []const []const u8 = &.{},
     help_sections: []const HelpSection = &.{},
     double_dash: DoubleDashMode = .passthrough,
+    mounted_application: ?*const ApplicationSpec = null,
 };
 
 pub const ApplicationSpec = struct {
@@ -151,6 +152,20 @@ pub const ApplicationSpec = struct {
     examples: []const []const u8 = &.{},
     help_sections: []const HelpSection = &.{},
 };
+
+/// Mount an application under a command name. The application remains usable
+/// on its own and may be mounted at more than one path.
+pub fn mount(comptime name: []const u8, comptime application: ApplicationSpec) CommandSpec {
+    const Stored = struct {
+        const value = application;
+    };
+    return .{
+        .name = name,
+        .description = application.description,
+        .usage = application.usage,
+        .mounted_application = &Stored.value,
+    };
+}
 
 /// The help flag every generated help listing and completion script offers.
 pub const help_flag = FlagSpec{
@@ -357,6 +372,32 @@ pub const Command = struct {
     name: []const u8,
     spec: CommandSpec,
     parsed: Parsed,
+    child: ?*Command = null,
+    path: ?[]u8 = null,
+    source_application_name: []const u8 = "",
+    source_path: []const u8 = "",
+    help_requested: bool = false,
+
+    fn deinit(self: *Command, allocator: Allocator) void {
+        if (self.child) |child| {
+            child.deinit(allocator);
+            allocator.destroy(child);
+        }
+        self.parsed.deinit(allocator);
+        if (self.path) |path| allocator.free(path);
+    }
+
+    pub fn getCommand(self: *const Command) ?*const Command {
+        return self.child;
+    }
+
+    pub fn printHelp(self: *const Command, allocator: Allocator, writer: anytype) !void {
+        if (self.spec.mounted_application) |application| {
+            try printApplicationHelpAt(allocator, writer, application.*, self.path.?);
+        } else {
+            try printCommandHelpAt(allocator, writer, self.spec, self.source_application_name, self.source_path);
+        }
+    }
 
     pub fn present(self: *const Command, option: []const u8) bool {
         return self.parsed.present(option);
@@ -415,7 +456,7 @@ pub const Invocation = struct {
     pub fn deinit(self: *Invocation, allocator: Allocator) void {
         const application = self.application;
         self.root.deinit(allocator);
-        if (self.command) |*command| command.parsed.deinit(allocator);
+        if (self.command) |*command| command.deinit(allocator);
         self.* = .{ .application = application };
     }
 
@@ -444,7 +485,13 @@ pub const Invocation = struct {
         switch (self.help_target) {
             .none => return false,
             .application => try printApplicationHelp(allocator, writer, self.application),
-            .command => try printCommandHelp(allocator, writer, self.command.?.spec),
+            .command => {
+                var command = self.getCommand().?;
+                while (!command.help_requested) {
+                    command = command.getCommand().?;
+                }
+                try command.printHelp(allocator, writer);
+            },
         }
         return true;
     }
@@ -595,6 +642,8 @@ pub const SpecError = error{
     ConflictingCompletion,
     DefaultNotInChoices,
     InvalidDefaultValue,
+    ConflictingMountMetadata,
+    CyclicMount,
 };
 
 /// Command and long-option names use a conservative grammar that is safe in
@@ -687,6 +736,10 @@ pub fn validateCommandSpec(spec: CommandSpec) SpecError!void {
     }
     try validateFlags(spec.flags);
     try validateArgumentShape(spec.arguments);
+    if (spec.mounted_application != null and
+        (spec.flags.len != 0 or spec.arguments.len != 0 or spec.double_dash != .passthrough or
+            spec.extra_help != null or spec.examples.len != 0 or spec.help_sections.len != 0))
+        return error.ConflictingMountMetadata;
 }
 
 /// Validates a specification at compile time and returns it unchanged, so an
@@ -731,6 +784,10 @@ const branches_per_comparison = 64;
 /// An upper bound on the branches `validateApplicationSpec` needs, from the
 /// number of name pairs it compares.
 fn validationBranchQuota(comptime application: ApplicationSpec) usize {
+    return walk_branch_quota + branches_per_comparison * validationPairs(application, null);
+}
+
+fn validationPairs(comptime application: ApplicationSpec, comptime ancestors: ?*const MountAncestor) usize {
     var pairs = scopeNameCount(application.flags);
     pairs *= pairs;
 
@@ -740,10 +797,21 @@ fn validationBranchQuota(comptime application: ApplicationSpec) usize {
         const flag_names = scopeNameCount(command.flags);
         pairs += flag_names * flag_names;
         pairs += command.arguments.len * command.arguments.len;
+        if (command.mounted_application) |child| {
+            var cyclic = false;
+            var current = ancestors;
+            while (current) |ancestor| : (current = ancestor.parent) {
+                if (ancestor.application == child) cyclic = true;
+            }
+            if (!cyclic) {
+                const next = MountAncestor{ .application = child, .parent = ancestors };
+                pairs += validationPairs(child.*, &next);
+            }
+        }
     }
     pairs += command_names * command_names;
 
-    return walk_branch_quota + branches_per_comparison * pairs;
+    return pairs;
 }
 
 /// Every spelling an option in this scope can be written as.
@@ -754,11 +822,29 @@ fn scopeNameCount(flags: []const FlagSpec) usize {
 }
 
 pub fn validateApplicationSpec(application: ApplicationSpec) SpecError!void {
+    const root = MountAncestor{ .application = &application, .parent = null };
+    return validateApplicationTree(&application, &root);
+}
+
+const MountAncestor = struct {
+    application: *const ApplicationSpec,
+    parent: ?*const MountAncestor,
+};
+
+fn validateApplicationTree(application: *const ApplicationSpec, ancestry: *const MountAncestor) SpecError!void {
     if (!isValidName(application.name)) return error.InvalidName;
     try validateFlags(application.flags);
 
     for (application.commands, 0..) |command, i| {
         try validateCommandSpec(command);
+        if (command.mounted_application) |child| {
+            var current: ?*const MountAncestor = ancestry;
+            while (current) |node| : (current = node.parent) {
+                if (node.application == child) return error.CyclicMount;
+            }
+            const next = MountAncestor{ .application = child, .parent = ancestry };
+            try validateApplicationTree(child, &next);
+        }
         for (application.commands[i + 1 ..]) |other| {
             if (commandNamesOverlap(command, other)) return error.DuplicateName;
         }
@@ -814,6 +900,7 @@ pub fn parseCommand(
     args: []const [:0]const u8,
     spec: CommandSpec,
 ) !Parsed {
+    if (spec.mounted_application != null) return error.MountedCommandRequiresInvocation;
     var diagnostic = ParseDiagnostic{};
     var scope = parseScope(allocator, args, spec.flags, .complete, null, null, false, spec.double_dash, &diagnostic) catch |err| {
         if (err != error.InvalidArgument) return err;
@@ -880,40 +967,140 @@ fn initInvocation(
         return error.ReportedCliError;
     };
 
-    var command_scope = parseScope(
+    var command = try parseSelectedCommand(
         allocator,
+        writer,
+        command_spec,
+        application,
+        application.name,
         args[root_scope.next_index + 1 ..],
-        command_spec.flags,
-        .complete,
-        .{ .prefix = application.prefix, .environ = environ },
-        null,
-        true,
-        command_spec.double_dash,
-        &diagnostic,
-    ) catch |err| {
-        if (err != error.InvalidArgument) return err;
-        try printParseError(writer, command_spec, diagnostic);
-        return error.ReportedCliError;
-    };
-    errdefer command_scope.parsed.deinit(allocator);
-
-    if (!command_scope.help_requested) {
-        validateArguments(command_scope.parsed.positionals.items, command_spec.arguments, &diagnostic) catch |err| {
-            if (err != error.InvalidArgument) return err;
-            try printParseError(writer, command_spec, diagnostic);
-            return error.ReportedCliError;
-        };
-    }
+        environ,
+    );
+    errdefer command.deinit(allocator);
+    const help_requested = commandHelpRequested(&command);
 
     return .{
         .application = application,
         .root = root_scope.parsed,
-        .command = .{
-            .name = command_spec.name,
-            .spec = command_spec,
-            .parsed = command_scope.parsed,
-        },
-        .help_target = if (command_scope.help_requested) .command else .none,
+        .command = command,
+        .help_target = if (help_requested) .command else .none,
+    };
+}
+
+fn commandHelpRequested(command: *const Command) bool {
+    if (command.help_requested) return true;
+    if (command.child) |child| return commandHelpRequested(child);
+    return false;
+}
+
+fn parseSelectedCommand(
+    allocator: Allocator,
+    writer: anytype,
+    spec: CommandSpec,
+    owner: ApplicationSpec,
+    parent_path: []const u8,
+    args: []const [:0]const u8,
+    environ: *const std.process.Environ.Map,
+) !Command {
+    const path = try std.fmt.allocPrint(allocator, "{s} {s}", .{ parent_path, spec.name });
+    errdefer allocator.free(path);
+    var diagnostic = ParseDiagnostic{};
+
+    if (spec.mounted_application) |mounted| {
+        const app = mounted.*;
+        var scope = parseScope(
+            allocator,
+            args,
+            app.flags,
+            .root,
+            .{ .prefix = app.prefix, .environ = environ },
+            app,
+            true,
+            .passthrough,
+            &diagnostic,
+        ) catch |err| {
+            if (err != error.InvalidArgument) return err;
+            try printParseErrorAt(writer, .{
+                .name = app.name,
+                .description = app.description,
+                .usage = app.usage,
+                .flags = app.flags,
+            }, diagnostic, app.name, path, path);
+            return error.ReportedCliError;
+        };
+        errdefer scope.parsed.deinit(allocator);
+
+        var child: ?*Command = null;
+        errdefer if (child) |value| {
+            value.deinit(allocator);
+            allocator.destroy(value);
+        };
+        if (!scope.help_requested and scope.next_index < args.len) {
+            const token = args[scope.next_index];
+            const child_spec = findCommand(app, token) orelse {
+                try writer.print("error: unknown command '{s}'\n\n", .{token});
+                try printApplicationHelpAt(allocator, writer, app, path);
+                return error.ReportedCliError;
+            };
+            const value = try parseSelectedCommand(
+                allocator,
+                writer,
+                child_spec,
+                app,
+                path,
+                args[scope.next_index + 1 ..],
+                environ,
+            );
+            child = allocator.create(Command) catch |err| {
+                var disposable = value;
+                disposable.deinit(allocator);
+                return err;
+            };
+            child.?.* = value;
+        }
+        return .{
+            .name = spec.name,
+            .spec = spec,
+            .parsed = scope.parsed,
+            .child = child,
+            .path = path,
+            .source_application_name = app.name,
+            .source_path = path,
+            .help_requested = scope.help_requested,
+        };
+    }
+
+    var scope = parseScope(
+        allocator,
+        args,
+        spec.flags,
+        .complete,
+        .{ .prefix = owner.prefix, .environ = environ },
+        null,
+        true,
+        spec.double_dash,
+        &diagnostic,
+    ) catch |err| {
+        if (err != error.InvalidArgument) return err;
+        try printParseErrorAt(writer, spec, diagnostic, owner.name, parent_path, path);
+        return error.ReportedCliError;
+    };
+    errdefer scope.parsed.deinit(allocator);
+    if (!scope.help_requested) {
+        validateArguments(scope.parsed.positionals.items, spec.arguments, &diagnostic) catch |err| {
+            if (err != error.InvalidArgument) return err;
+            try printParseErrorAt(writer, spec, diagnostic, owner.name, parent_path, path);
+            return error.ReportedCliError;
+        };
+    }
+    return .{
+        .name = spec.name,
+        .spec = spec,
+        .parsed = scope.parsed,
+        .path = path,
+        .source_application_name = owner.name,
+        .source_path = parent_path,
+        .help_requested = scope.help_requested,
     };
 }
 
@@ -1382,8 +1569,31 @@ pub fn parseBool(value: []const u8) !bool {
 }
 
 fn printParseError(writer: anytype, spec: CommandSpec, diagnostic: ParseDiagnostic) !void {
+    return printParseErrorContext(writer, spec, diagnostic, null, commandLabel(spec));
+}
+
+fn printParseErrorAt(
+    writer: anytype,
+    spec: CommandSpec,
+    diagnostic: ParseDiagnostic,
+    source_name: []const u8,
+    parent_path: []const u8,
+    full_path: []const u8,
+) !void {
+    return printParseErrorContext(writer, spec, diagnostic, .{
+        .source = source_name,
+        .path = parent_path,
+    }, full_path);
+}
+
+fn printParseErrorContext(
+    writer: anytype,
+    spec: CommandSpec,
+    diagnostic: ParseDiagnostic,
+    rebase: ?HelpRebase,
+    label: []const u8,
+) !void {
     const flag_name = diagnostic.flag_name orelse diagnostic.token;
-    const label = commandLabel(spec);
 
     switch (diagnostic.issue) {
         .unknown_option => try writer.print(
@@ -1443,10 +1653,9 @@ fn printParseError(writer: anytype, spec: CommandSpec, diagnostic: ParseDiagnost
         ),
     }
 
-    try writer.print(
-        "\nUsage: {s}\n\nTry '{s} --help' for more information.\n",
-        .{ spec.usage, label },
-    );
+    try writer.writeAll("\nUsage: ");
+    try writeRebased(writer, spec.usage, rebase);
+    try writer.print("\n\nTry '{s} --help' for more information.\n", .{label});
 }
 
 fn shortName(flags: []const FlagSpec, name: ?[]const u8) u8 {
@@ -1498,7 +1707,25 @@ fn heading(writer: anytype, title: []const u8) !void {
     try writer.writeByte('\n');
 }
 
-fn printHelpIntro(writer: anytype, width: usize, description: []const u8, usage: []const u8) !void {
+const HelpRebase = struct {
+    source: []const u8,
+    path: []const u8,
+};
+
+fn writeRebased(writer: anytype, value: []const u8, rebase: ?HelpRebase) !void {
+    if (rebase) |context| {
+        if (std.mem.startsWith(u8, value, context.source) and
+            (value.len == context.source.len or std.ascii.isWhitespace(value[context.source.len])))
+        {
+            try writer.writeAll(context.path);
+            try writer.writeAll(value[context.source.len..]);
+            return;
+        }
+    }
+    try writer.writeAll(value);
+}
+
+fn printHelpIntro(writer: anytype, width: usize, description: []const u8, usage: []const u8, rebase: ?HelpRebase) !void {
     if (description.len > 0) {
         try writer.writeByte('\n');
         const indent = @min(2, width - 1);
@@ -1511,11 +1738,11 @@ fn printHelpIntro(writer: anytype, width: usize, description: []const u8, usage:
     try heading(writer, "USAGE");
     try writer.writeAll("    ");
     // Usage is caller-authored: preserve its text instead of parsing syntax.
-    try writer.writeAll(usage);
+    try writeRebased(writer, usage, rebase);
     try writer.writeByte('\n');
 }
 
-fn printHelpExtras(writer: anytype, width: usize, spec: anytype) !void {
+fn printHelpExtras(writer: anytype, width: usize, spec: anytype, rebase: ?HelpRebase) !void {
     for (spec.help_sections) |section| {
         if (section.entries.len == 0) continue;
         try heading(writer, section.title);
@@ -1535,7 +1762,7 @@ fn printHelpExtras(writer: anytype, width: usize, spec: anytype) !void {
         try heading(writer, "EXAMPLES");
         for (spec.examples) |example| {
             try writer.writeAll("    ");
-            try writer.writeAll(example);
+            try writeRebased(writer, example, rebase);
             try writer.writeByte('\n');
         }
     }
@@ -1559,19 +1786,44 @@ fn printHelpExtras(writer: anytype, width: usize, spec: anytype) !void {
 }
 
 pub fn printApplicationHelp(allocator: Allocator, writer: anytype, application: ApplicationSpec) !void {
+    return printApplicationHelpContext(allocator, writer, application, null);
+}
+
+fn printApplicationHelpAt(allocator: Allocator, writer: anytype, application: ApplicationSpec, path: []const u8) !void {
+    return printApplicationHelpContext(allocator, writer, application, .{
+        .source = application.name,
+        .path = path,
+    });
+}
+
+fn printApplicationHelpContext(allocator: Allocator, writer: anytype, application: ApplicationSpec, rebase: ?HelpRebase) !void {
     const width = writerHelpWidth(writer);
-    try printHelpIntro(writer, width, application.description, application.usage);
+    try printHelpIntro(writer, width, application.description, application.usage, rebase);
     try printCommandListWidth(writer, width, application.commands);
     try printOptionsWidth(allocator, writer, width, application.flags, true);
-    try printHelpExtras(writer, width, application);
+    try printHelpExtras(writer, width, application, rebase);
 }
 
 pub fn printCommandHelp(allocator: Allocator, writer: anytype, spec: CommandSpec) !void {
+    if (spec.mounted_application) |application| {
+        return printApplicationHelpAt(allocator, writer, application.*, spec.name);
+    }
+    return printCommandHelpContext(allocator, writer, spec, null);
+}
+
+fn printCommandHelpAt(allocator: Allocator, writer: anytype, spec: CommandSpec, source_name: []const u8, parent_path: []const u8) !void {
+    return printCommandHelpContext(allocator, writer, spec, .{
+        .source = source_name,
+        .path = parent_path,
+    });
+}
+
+fn printCommandHelpContext(allocator: Allocator, writer: anytype, spec: CommandSpec, rebase: ?HelpRebase) !void {
     const width = writerHelpWidth(writer);
-    try printHelpIntro(writer, width, spec.description, spec.usage);
+    try printHelpIntro(writer, width, spec.description, spec.usage, rebase);
     try printArgumentsWidth(writer, width, spec.arguments);
     try printOptionsWidth(allocator, writer, width, spec.flags, true);
-    try printHelpExtras(writer, width, spec);
+    try printHelpExtras(writer, width, spec, rebase);
 }
 
 // Avoid leaving only a few columns for descriptions beside long labels.

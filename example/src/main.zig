@@ -35,6 +35,7 @@ const root_flags = [_]cli.FlagSpec{
         .name = "config",
         .aliases = &.{"configuration"},
         .short = 'c',
+        .attached_short_value = true,
         .value = .string,
         .value_name = "FILE",
         .description = "Config file path",
@@ -120,7 +121,93 @@ const completion_arguments = [_]cli.ArgumentSpec{
     },
 };
 
+const config_commands = [_]cli.CommandSpec{
+    .{
+        .name = "get",
+        .description = "Read a setting",
+        .usage = "zecli-config get <KEY>",
+        .arguments = &.{.{ .name = "KEY", .required = true }},
+    },
+    .{
+        .name = "set",
+        .aliases = &.{"put"},
+        .description = "Set a value",
+        .usage = "zecli-config set [options] <KEY> <VALUE>",
+        .flags = &.{ .{
+            .name = "mode",
+            .value = .string,
+            .description = "Storage mode",
+            .choices = &.{ "local", "shared" },
+        }, .{
+            .name = "ref",
+            .value = .string,
+            .description = "Reference to resolve",
+            .completion = .{ .external = .{
+                .executable = "zecli-example",
+                .arguments = &.{"complete"},
+            } },
+        } },
+        .arguments = &.{
+            .{ .name = "KEY", .required = true },
+            .{ .name = "VALUE", .required = true },
+        },
+    },
+    .{
+        .name = "show",
+        .description = "Show a file path",
+        .usage = "zecli-config show <FILE>",
+        .arguments = &.{.{ .name = "FILE", .required = true, .completion = .files }},
+        .double_dash = .positionals,
+    },
+};
+
+const config_app = cli.comptimeValidated(.{
+    .name = "zecli-config",
+    .prefix = "ZECLI_CONFIG",
+    .description = "Manage settings",
+    .usage = "zecli-config [options] <command>",
+    .flags = &.{
+        .{ .name = "profile", .value = .string, .description = "Profile", .choices = &.{ "work", "personal" } },
+        .{ .name = "store", .value = .string, .description = "Store file", .completion = .files },
+        .{ .name = "dry-run", .value = .bool_optional, .description = "Preview changes" },
+    },
+    .commands = &config_commands,
+});
+
+const admin_app = cli.comptimeValidated(.{
+    .name = "zecli-admin",
+    .description = "Administrative commands",
+    .usage = "zecli-admin <command>",
+    .commands = &.{cli.mount("config", config_app)},
+});
+
+const catalog_app = cli.comptimeValidated(.{
+    .name = "zecli-catalog",
+    .description = "Catalog settings",
+    .usage = "zecli-catalog <command>",
+    .commands = &.{.{
+        .name = "set",
+        .description = "Select a catalog mode",
+        .usage = "zecli-catalog set --mode <MODE>",
+        .flags = &.{.{
+            .name = "mode",
+            .value = .string,
+            .choices = &.{ "fast", "safe" },
+        }},
+    }},
+});
+
+const config_mount = blk: {
+    var spec = cli.mount("config", config_app);
+    spec.aliases = &.{"cfg"};
+    break :blk spec;
+};
+
 const commands = [_]cli.CommandSpec{
+    config_mount,
+    cli.mount("settings", config_app),
+    cli.mount("admin", admin_app),
+    cli.mount("catalog", catalog_app),
     .{
         .name = "greet",
         .aliases = &.{"hi"},
@@ -215,11 +302,43 @@ fn run(
     };
 
     switch (try command.as(CommandName)) {
+        .config, .settings => return runConfig(allocator, stdout, command),
+        .admin => {
+            const group = command.getCommand() orelse {
+                try command.printHelp(allocator, stdout);
+                return 0;
+            };
+            return runConfig(allocator, stdout, group);
+        },
+        .catalog => {
+            const action = command.getCommand() orelse {
+                try command.printHelp(allocator, stdout);
+                return 0;
+            };
+            try stdout.print("catalog mode: {s}\n", .{action.getValue([]const u8, "mode") orelse "default"});
+            return 0;
+        },
         .greet => return runGreet(stdout, command),
         .cat => return runCat(stdout, command),
         .complete => return runComplete(stdout, command),
         .completion => return runCompletion(stdout, stderr, command),
     }
+}
+
+fn runConfig(allocator: std.mem.Allocator, stdout: anytype, group: *const cli.Command) !u8 {
+    const action = group.getCommand() orelse {
+        try group.printHelp(allocator, stdout);
+        return 0;
+    };
+    const profile = group.getValue([]const u8, "profile") orelse "default";
+    switch (try action.as(cli.CommandEnum(config_app))) {
+        .get => try stdout.print("{s}: {s}\n", .{ profile, action.positionals()[0] }),
+        .set => try stdout.print("{s}: {s}={s}\n", .{
+            profile, action.positionals()[0], action.positionals()[1],
+        }),
+        .show => try stdout.print("{s}: {s}\n", .{ profile, action.positionals()[0] }),
+    }
+    return 0;
 }
 
 fn runGreet(

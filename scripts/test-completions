@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: scripts/test-completions <example-binary>" >&2
+  exit 2
+fi
+example_bin_dir=$(cd "$(dirname "$1")" && pwd)
+example_bin="$example_bin_dir/$(basename "$1")"
+RUNNER_TEMP=$(mktemp -d)
+trap 'rm -rf "$RUNNER_TEMP"' EXIT
+export RUNNER_TEMP
+export PATH="$example_bin_dir:$PATH"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$script_dir/.."
+
+"$example_bin" completion bash > "$RUNNER_TEMP/completion.bash"
+"$example_bin" completion zsh > "$RUNNER_TEMP/completion.zsh"
+"$example_bin" completion fish > "$RUNNER_TEMP/completion.fish"
+bash -n "$RUNNER_TEMP/completion.bash"
+zsh -n "$RUNNER_TEMP/completion.zsh"
+fish -n "$RUNNER_TEMP/completion.fish"
+
+test "$("$example_bin" config --profile work set --mode local key value)" = 'work: key=value'
+test "$("$example_bin" admin config set key value)" = 'default: key=value'
+[[ "$("$example_bin" config set --help)" == *'zecli-example config set [options] <KEY> <VALUE>'* ]]
+[[ "$("$example_bin" admin config --help)" == *'zecli-example admin config [options] <command>'* ]]
+if "$example_bin" config set --home /tmp key value >"$RUNNER_TEMP/invalid.out" 2>&1; then
+  echo 'FAIL - ancestor flag accepted after entering a mounted command' >&2
+  exit 1
+fi
+
+cat > "$RUNNER_TEMP/smoke.bash" <<'SCRIPT'
+set -u
+source "$1"
+fail=0
+
+candidates() {
+    COMP_WORDS=("$@")
+    COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+    COMPREPLY=()
+    _zecli_example
+}
+
+check() {
+    local label="$1" expected="$2"; shift 2
+    candidates "$@"
+    local item
+    for item in "${COMPREPLY[@]-}"; do
+        if [ "$item" = "$expected" ]; then echo "ok   - $label"; return; fi
+    done
+    echo "FAIL - $label (expected '$expected', got: ${COMPREPLY[*]-})"
+    fail=1
+}
+
+refute() {
+    local label="$1" unexpected="$2"; shift 2
+    candidates "$@"
+    local item
+    for item in "${COMPREPLY[@]-}"; do
+        if [ "$item" = "$unexpected" ]; then
+            echo "FAIL - $label (did not expect '$unexpected')"; fail=1; return
+        fi
+    done
+    echo "ok   - $label"
+}
+
+check "commands offered"          greet             zecli-example ""
+check "alias offered"             hi                zecli-example ""
+check "root option before cmd"    greet             zecli-example --home /tmp gr
+check "inline root option value"  greet             zecli-example --home=/tmp gr
+check "option value is not a cmd" greet             zecli-example --home greet ""
+check "command options"           --color           zecli-example greet -
+check "long option alias"         --colour          zecli-example greet -
+check "choices"                   always            zecli-example greet --color ""
+check "choices via alias"         always            zecli-example greet --colour ""
+check "choices after ="           always            zecli-example greet --color = ""
+refute "no options after --"      --color           zecli-example greet -- -
+check "external candidate"        "note with space" zecli-example cat --ref ""
+check "external prefix"           "@42/out"         zecli-example cat --ref @4
+check "mounted command"           get               zecli-example config ""
+check "mount after root flag"     get               zecli-example --home /tmp config ""
+check "mount after attached value" get             zecli-example -csettings config ""
+check "flag value equals mount"   get               zecli-example --config config config ""
+check "mount alias"               get               zecli-example cfg ""
+check "mounted root value"        set               zecli-example config --profile work ""
+check "optional bool before child" set               zecli-example config --dry-run ""
+check "mounted leaf option"       --mode            zecli-example config set -
+check "mounted leaf choice"       local             zecli-example config set --mode ""
+check "reused mount"              set               zecli-example settings ""
+check "deeper mount"              set               zecli-example admin config ""
+check "nested positional after --" example/src/main.zig zecli-example config show -- example/src/mai
+check "mounted external"          "note with space" zecli-example config set --ref ""
+check "other mount choices"       fast              zecli-example catalog set --mode ""
+refute "distinct mount choices"   local             zecli-example catalog set --mode ""
+refute "no sibling option"        --color           zecli-example config set -
+refute "no nested option after --" --mode            zecli-example config set -- -
+
+exit "$fail"
+SCRIPT
+PATH="$example_bin_dir:$PATH" bash "$RUNNER_TEMP/smoke.bash" "$RUNNER_TEMP/completion.bash"
+
+# Fish may print invalid registration diagnostics and still exit 0.
+fish --no-config -c 'source $argv[1]' "$RUNNER_TEMP/completion.fish" \
+  2> "$RUNNER_TEMP/fish-source.stderr"
+if test -s "$RUNNER_TEMP/fish-source.stderr"; then
+  cat "$RUNNER_TEMP/fish-source.stderr"
+  exit 1
+fi
+cat > "$RUNNER_TEMP/smoke.fish" <<'SCRIPT'
+source $argv[1]
+set -g fail 0
+
+# The zecli002 prefix keeps matches independent of checkout files.
+set -l fixture_dir (mktemp -d)
+cd $fixture_dir
+touch zecli002-file 'zecli002 spaced'
+mkdir zecli002-dir
+
+function check
+    set -l result (complete -C $argv[3] | string split -f1 \t)
+    if contains -- $argv[2] $result
+        echo "ok   - $argv[1]"
+    else
+        echo "FAIL - $argv[1] (expected '$argv[2]', got: $result)"
+        set -g fail 1
+    end
+end
+
+function refute
+    set -l result (complete -C $argv[3] | string split -f1 \t)
+    if contains -- $argv[2] $result
+        echo "FAIL - $argv[1] (did not expect '$argv[2]')"
+        set -g fail 1
+    else
+        echo "ok   - $argv[1]"
+    end
+end
+
+check "commands offered" greet 'zecli-example '
+check "alias offered" hi 'zecli-example '
+check "root option before cmd" greet 'zecli-example --home /tmp gr'
+check "inline root option value" greet 'zecli-example --home=/tmp gr'
+check "option value is not a cmd" greet 'zecli-example --home greet '
+check "command options" --color 'zecli-example greet -'
+check "long option alias" --colour 'zecli-example greet -'
+check "choices" always 'zecli-example greet --color '
+check "choices via alias" always 'zecli-example greet --colour '
+refute "no options after --" --color 'zecli-example greet -- -'
+check "external candidate" "note with space" 'zecli-example cat --ref '
+check "external prefix" "@42/out" 'zecli-example cat --ref @4'
+check "root file flag" zecli002-file 'zecli-example --config zecli002'
+check "short file flag" zecli002-file 'zecli-example -c zecli002'
+check "file flag alias" zecli002-file 'zecli-example --configuration zecli002'
+check "inline file value" --config=zecli002-file 'zecli-example --config=zecli002'
+check "file with spaces" 'zecli002 spaced' 'zecli-example --config zecli002'
+refute "directory-only excludes files" zecli002-file 'zecli-example --home zecli002'
+refute "choices exclude files" zecli002-file 'zecli-example greet --color zecli002'
+check "positional files" zecli002-file 'zecli-example cat zecli002'
+check "mounted command" get 'zecli-example config '
+check "mount after root flag" get 'zecli-example --home /tmp config '
+check "mount after attached value" get 'zecli-example -csettings config '
+check "flag value equals mount" get 'zecli-example --config config config '
+check "mount alias" get 'zecli-example cfg '
+check "mounted root value" set 'zecli-example config --profile work '
+check "optional bool before child" set 'zecli-example config --dry-run '
+check "mounted leaf option" --mode 'zecli-example config set --'
+check "mounted leaf choice" local 'zecli-example config set --mode '
+check "reused mount" set 'zecli-example settings '
+check "deeper mount" set 'zecli-example admin config '
+check "nested positional after --" zecli002-file 'zecli-example config show -- zecli002'
+check "mounted external" "note with space" 'zecli-example config set --ref '
+check "other mount choices" fast 'zecli-example catalog set --mode '
+refute "distinct mount choices" local 'zecli-example catalog set --mode '
+check "mounted file" zecli002-file 'zecli-example config --store zecli002'
+check "mounted inline file" --store=zecli002-file 'zecli-example config --store=zecli002'
+refute "mounted choices exclude files" zecli002-file 'zecli-example config --profile zecli002'
+refute "mounted sibling option" --color 'zecli-example config set --'
+refute "no nested option after --" --mode 'zecli-example config set -- -'
+
+exit $fail
+SCRIPT
+if ! PATH="$example_bin_dir:$PATH" fish --no-config \
+  "$RUNNER_TEMP/smoke.fish" "$RUNNER_TEMP/completion.fish" \
+  2> "$RUNNER_TEMP/fish-behavior.stderr"; then
+  cat "$RUNNER_TEMP/fish-behavior.stderr"
+  exit 1
+fi
+if test -s "$RUNNER_TEMP/fish-behavior.stderr"; then
+  cat "$RUNNER_TEMP/fish-behavior.stderr"
+  exit 1
+fi
+
+cat > "$RUNNER_TEMP/smoke.zsh" <<'SCRIPT'
+# zsh completion only runs inside ZLE, so drive a real zsh in a pty and
+# capture the matches where they are added rather than parsing output.
+emulate -L zsh
+zmodload zsh/zpty
+
+script=$1
+work=${TMPDIR:-/tmp}/zecli-smoke.$$
+mkdir -p $work
+cap=$work/capture
+: > $cap
+typeset -g out fail=0 sync=0
+
+zpty zt zsh -f -i
+zpty -w zt "PS1='ZMARK '"
+zpty -r -m zt out '*ZMARK *' || { print "FAIL - no zsh pty"; exit 1 }
+
+send() {
+    (( sync++ ))
+    local tag="SYNC${sync}DONE"
+    zpty -w zt "$1; print $tag"
+    zpty -r -m zt out "*${tag}*ZMARK *"
+}
+
+send "autoload -Uz compinit && compinit -u -d $work/dump" || exit 1
+send "source ${(q)script}" || exit 1
+send "compadd() { local -a __m; builtin compadd -O __m \"\$@\"; print -lr -- \"\${__m[@]}\" >> ${(q)cap}; builtin compadd \"\$@\" }" || exit 1
+
+complete_line() {
+    : > $cap
+    zpty -w -n zt "$1"$'\t'
+    local waited=0
+    while (( waited < 100 )) && [[ ! -s $cap ]]; do
+        sleep 0.1
+        (( waited++ ))
+    done
+    sleep 0.5
+    zpty -w -n zt $'\C-c'
+    send "true"
+}
+
+check() {
+    complete_line $3
+    if grep -qxF -- "$2" $cap 2>/dev/null; then
+        print "ok   - $1"
+    else
+        print "FAIL - $1 (expected '$2')"
+        fail=1
+    fi
+}
+
+refute() {
+    complete_line $3
+    if grep -qxF -- "$2" $cap 2>/dev/null; then
+        print "FAIL - $1 (did not expect '$2')"
+        fail=1
+    else
+        print "ok   - $1"
+    fi
+}
+
+check "commands offered" greet 'zecli-example '
+check "alias offered" hi 'zecli-example '
+check "root option before cmd" greet 'zecli-example --home /tmp gr'
+check "inline root option value" greet 'zecli-example --home=/tmp gr'
+check "option value is not a cmd" greet 'zecli-example --home greet '
+check "command options" --color 'zecli-example greet -'
+check "long option alias" --colour 'zecli-example greet -'
+check "choices" always 'zecli-example greet --color '
+check "choices via alias" always 'zecli-example greet --colour '
+refute "no options after --" --color 'zecli-example greet -- -'
+check "external candidate" 'note with space' 'zecli-example cat --ref '
+check "external prefix" '@42/out' 'zecli-example cat --ref @4'
+check "mounted command" get 'zecli-example config '
+check "mount after root flag" get 'zecli-example --home /tmp config '
+check "mount after attached value" get 'zecli-example -csettings config '
+check "flag value equals mount" get 'zecli-example --config config config '
+check "mount alias" get 'zecli-example cfg '
+check "mounted root value" set 'zecli-example config --profile work '
+check "optional bool before child" set 'zecli-example config --dry-run '
+check "mounted leaf option" --mode 'zecli-example config set -'
+check "mounted leaf choice" local 'zecli-example config set --mode '
+check "reused mount" set 'zecli-example settings '
+check "deeper mount" set 'zecli-example admin config '
+check "nested positional after --" main.zig 'zecli-example config show -- example/src/mai'
+check "mounted external" 'note with space' 'zecli-example config set --ref '
+check "other mount choices" fast 'zecli-example catalog set --mode '
+refute "distinct mount choices" local 'zecli-example catalog set --mode '
+refute "mounted sibling option" --color 'zecli-example config set -'
+refute "no nested option after --" --mode 'zecli-example config set -- -'
+
+zpty -d zt
+rm -rf $work
+exit $fail
+SCRIPT
+PATH="$example_bin_dir:$PATH" zsh "$RUNNER_TEMP/smoke.zsh" "$RUNNER_TEMP/completion.zsh"

@@ -13,6 +13,336 @@ const NullWriter = struct {
 const nw = NullWriter{};
 var empty_environ = std.process.Environ.Map.init(std.heap.page_allocator);
 
+const mounted_app = cli.comptimeValidated(.{
+    .name = "inner",
+    .prefix = "INNER",
+    .description = "Mounted commands",
+    .usage = "inner [options] <command>",
+    .examples = &.{ "inner set key", "innerish remains unchanged" },
+    .flags = &.{
+        .{ .name = "profile", .value = .string },
+        .{ .name = "dry-run", .value = .bool_optional },
+    },
+    .commands = &.{ .{
+        .name = "set",
+        .description = "Set a value",
+        .usage = "inner set <KEY>",
+        .examples = &.{"inner set key"},
+        .arguments = &.{.{ .name = "KEY", .required = true }},
+        .flags = &.{.{ .name = "value", .value = .string }},
+    }, .{
+        .name = "show",
+        .description = "Show a path",
+        .usage = "inner show <FILE>",
+        .arguments = &.{.{ .name = "FILE", .required = true, .completion = .files }},
+        .double_dash = .positionals,
+    } },
+});
+
+const host_with_mount = cli.comptimeValidated(.{
+    .name = "host",
+    .description = "Host",
+    .usage = "host <command>",
+    .flags = &.{.{ .name = "root-only", .value = .string }},
+    .commands = &.{
+        cli.mount("config", mounted_app),
+        cli.mount("settings", mounted_app),
+        .{ .name = "plain", .description = "Plain", .usage = "host plain" },
+    },
+});
+
+test "mount: parses child commands with separate option scopes" {
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host_with_mount,
+        &.{ "config", "--profile", "work", "set", "--value", "yes", "key" },
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    const group = invocation.getCommand().?;
+    try testing.expectEqualStrings("config", group.name);
+    try testing.expectEqualStrings("work", group.getValue([]const u8, "profile").?);
+    const action = group.getCommand().?;
+    try testing.expectEqualStrings("set", action.name);
+    try testing.expectEqualStrings("yes", action.getValue([]const u8, "value").?);
+    try testing.expectEqualStrings("key", action.positionals()[0]);
+}
+
+test "mount: help uses the canonical host path" {
+    var output = Buffer.init(testing.allocator);
+    defer output.deinit();
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        &output,
+        host_with_mount,
+        &.{ "settings", "set", "--help" },
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    try testing.expect(try invocation.printHelpIfRequested(testing.allocator, &output));
+    try testing.expect(std.mem.indexOf(u8, output.items(), "host settings set <KEY>") != null);
+}
+
+test "mount: unknown child reports mounted help" {
+    var output = Buffer.init(testing.allocator);
+    defer output.deinit();
+    try testing.expectError(error.ReportedCliError, cli.Invocation.init(
+        testing.allocator,
+        &output,
+        host_with_mount,
+        &.{ "config", "missing" },
+        &empty_environ,
+    ));
+    try testing.expect(std.mem.indexOf(u8, output.items(), "host config [options] <command>") != null);
+}
+
+test "mount: validates conflicting metadata, descendants, and cycles" {
+    var conflicting = cli.mount("group", mounted_app);
+    conflicting.flags = &.{.{ .name = "extra" }};
+    try testing.expectError(error.ConflictingMountMetadata, cli.validateCommandSpec(conflicting));
+
+    var alias = cli.mount("group", mounted_app);
+    alias.aliases = &.{"other"};
+    try testing.expectError(error.DuplicateName, cli.validateApplicationSpec(.{
+        .name = "host",
+        .description = "",
+        .usage = "host",
+        .commands = &.{ alias, .{ .name = "other", .description = "", .usage = "host other" } },
+    }));
+
+    const invalid_child = cli.ApplicationSpec{
+        .name = "child",
+        .description = "",
+        .usage = "child",
+        .flags = &.{.{ .name = "bad_name" }},
+    };
+    const invalid_host = cli.ApplicationSpec{
+        .name = "host",
+        .description = "",
+        .usage = "host",
+        .commands = &.{.{
+            .name = "child",
+            .description = "",
+            .usage = "child",
+            .mounted_application = &invalid_child,
+        }},
+    };
+    try testing.expectError(error.InvalidName, cli.validateApplicationSpec(invalid_host));
+
+    var cycle: cli.ApplicationSpec = undefined;
+    const commands = [_]cli.CommandSpec{.{
+        .name = "again",
+        .description = "",
+        .usage = "cycle again",
+        .mounted_application = &cycle,
+    }};
+    cycle = .{ .name = "cycle", .description = "", .usage = "cycle", .commands = &commands };
+    try testing.expectError(error.CyclicMount, cli.validateApplicationSpec(cycle));
+}
+
+test "mount: help and examples rebase only leading application names" {
+    var output = Buffer.init(testing.allocator);
+    defer output.deinit();
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        &output,
+        host_with_mount,
+        &.{"config"},
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    try invocation.getCommand().?.printHelp(testing.allocator, &output);
+    try testing.expect(std.mem.indexOf(u8, output.items(), "host config [options] <command>") != null);
+    try testing.expect(std.mem.indexOf(u8, output.items(), "host config set key") != null);
+    try testing.expect(std.mem.indexOf(u8, output.items(), "innerish remains unchanged") != null);
+
+    var standalone = Buffer.init(testing.allocator);
+    defer standalone.deinit();
+    try cli.printApplicationHelp(testing.allocator, &standalone, mounted_app);
+    try testing.expect(std.mem.indexOf(u8, standalone.items(), "inner [options] <command>") != null);
+}
+
+test "mount: uses its own environment prefix and survives moving the invocation" {
+    var environ = std.process.Environ.Map.init(testing.allocator);
+    defer environ.deinit();
+    try environ.put("INNER_PROFILE", "environment");
+    var original = try cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host_with_mount,
+        &.{ "settings", "set", "key" },
+        &environ,
+    );
+    var moved = original;
+    original = .{ .application = host_with_mount };
+    defer moved.deinit(testing.allocator);
+    const group = moved.getCommand().?;
+    try testing.expectEqualStrings("environment", group.getValue([]const u8, "profile").?);
+    try testing.expectEqualStrings("set", group.getCommand().?.name);
+}
+
+test "mount: a null prefix does not inherit the host prefix" {
+    const child_app = comptime cli.comptimeValidated(.{
+        .name = "child",
+        .description = "Child",
+        .usage = "child <command>",
+        .flags = &.{.{ .name = "profile", .value = .string, .default_value = "child-default" }},
+        .commands = &.{.{ .name = "leaf", .description = "Leaf", .usage = "child leaf" }},
+    });
+    const host = comptime cli.comptimeValidated(.{
+        .name = "host",
+        .prefix = "HOST",
+        .description = "Host",
+        .usage = "host <command>",
+        .flags = &.{.{ .name = "profile", .value = .string }},
+        .commands = &.{cli.mount("child", child_app)},
+    });
+    var environ = std.process.Environ.Map.init(testing.allocator);
+    defer environ.deinit();
+    try environ.put("HOST_PROFILE", "host-environment");
+    try environ.put("CHILD_PROFILE", "child-environment");
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host,
+        &.{ "child", "leaf" },
+        &environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    try testing.expectEqualStrings("host-environment", invocation.getValue([]const u8, "profile").?);
+    try testing.expectEqualStrings("child-default", invocation.getCommand().?.getValue([]const u8, "profile").?);
+}
+
+fn mountedAllocationProbe(allocator: std.mem.Allocator) !void {
+    var invocation = try cli.Invocation.init(
+        allocator,
+        nw,
+        host_with_mount,
+        &.{ "settings", "--profile", "work", "set", "--value", "yes", "key" },
+        &empty_environ,
+    );
+    defer invocation.deinit(allocator);
+    try testing.expectEqualStrings("yes", invocation.getCommand().?.getCommand().?.getValue([]const u8, "value").?);
+}
+
+test "mount: releases every allocation on failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, mountedAllocationProbe, .{});
+}
+
+test "mount: parseCommand requires Invocation" {
+    try testing.expectError(error.MountedCommandRequiresInvocation, cli.parseCommand(
+        testing.allocator,
+        nw,
+        &.{},
+        cli.mount("config", mounted_app),
+    ));
+}
+
+test "mount: values resembling commands and optional booleans preserve dispatch" {
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host_with_mount,
+        &.{ "config", "--profile", "set", "--dry-run", "set", "key" },
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    const group = invocation.getCommand().?;
+    try testing.expectEqualStrings("set", group.getValue([]const u8, "profile").?);
+    try testing.expect(group.enabled("dry-run"));
+    try testing.expectEqualStrings("set", group.getCommand().?.name);
+}
+
+test "mount: ancestor flags stay in their scope and leaf separators still work" {
+    var invalid = Buffer.init(testing.allocator);
+    defer invalid.deinit();
+    try testing.expectError(error.ReportedCliError, cli.Invocation.init(
+        testing.allocator,
+        &invalid,
+        host_with_mount,
+        &.{ "config", "--root-only", "x", "show", "file" },
+        &empty_environ,
+    ));
+    try testing.expect(std.mem.indexOf(u8, invalid.items(), "host config") != null);
+
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host_with_mount,
+        &.{ "--root-only", "x", "config", "show", "--", "-file" },
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    try testing.expectEqualStrings("x", invocation.getValue([]const u8, "root-only").?);
+    try testing.expectEqualStrings("-file", invocation.getCommand().?.getCommand().?.positionals()[0]);
+}
+
+test "mount: deeper command path and help" {
+    const admin = comptime cli.comptimeValidated(.{
+        .name = "admin-tool",
+        .description = "Admin",
+        .usage = "admin-tool <command>",
+        .commands = &.{cli.mount("config", mounted_app)},
+    });
+    const host = comptime cli.comptimeValidated(.{
+        .name = "tool",
+        .description = "Tool",
+        .usage = "tool <command>",
+        .commands = &.{cli.mount("admin", admin)},
+    });
+    var output = Buffer.init(testing.allocator);
+    defer output.deinit();
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        &output,
+        host,
+        &.{ "admin", "config", "set", "--help" },
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    try testing.expect(try invocation.printHelpIfRequested(testing.allocator, &output));
+    try testing.expect(std.mem.indexOf(u8, output.items(), "tool admin config set <KEY>") != null);
+    try testing.expectEqualStrings("set", invocation.getCommand().?.getCommand().?.getCommand().?.name);
+}
+
+test "mount: separators belong to the selected scope" {
+    try testing.expectError(error.ReportedCliError, cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host_with_mount,
+        &.{ "config", "--", "set" },
+        &empty_environ,
+    ));
+
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host_with_mount,
+        &.{ "config", "set", "key", "--", "--help" },
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    const leaf = invocation.getCommand().?.getCommand().?;
+    try testing.expectEqualStrings("key", leaf.positionals()[0]);
+    try testing.expectEqualStrings("--help", leaf.passthrough().?[0]);
+    try testing.expect(!(try invocation.printHelpIfRequested(testing.allocator, nw)));
+}
+
+test "mount: contextual help does not allocate" {
+    var invocation = try cli.Invocation.init(
+        testing.allocator,
+        nw,
+        host_with_mount,
+        &.{ "config", "set", "--help" },
+        &empty_environ,
+    );
+    defer invocation.deinit(testing.allocator);
+    var counting = CountingAllocator{ .parent = testing.allocator };
+    try testing.expect(try invocation.printHelpIfRequested(counting.allocator(), nw));
+    try testing.expectEqual(@as(usize, 0), counting.count);
+}
+
 // ── parseBool ────────────────────────────────────────────────────────────────
 
 test "parseBool: true strings" {
@@ -1881,6 +2211,17 @@ test "comptimeValidated handles a specification with many commands and options" 
     try testing.expectEqual(@as(usize, 24), large_app.commands.len);
     try testing.expectEqual(@as(usize, 10), large_app.commands[0].flags.len);
     try testing.expect(cli.findCommand(large_app, "c23") != null);
+}
+
+test "comptimeValidated handles a large application mounted twice" {
+    const host = comptime cli.comptimeValidated(.{
+        .name = "host",
+        .description = "Host",
+        .usage = "host <command>",
+        .commands = &.{ cli.mount("one", large_app), cli.mount("two", large_app) },
+    });
+    try testing.expectEqual(@as(usize, 2), host.commands.len);
+    try testing.expectEqual(@as(usize, 24), host.commands[1].mounted_application.?.commands.len);
 }
 
 test "printCommandHelp: shows option aliases, choices, and defaults" {

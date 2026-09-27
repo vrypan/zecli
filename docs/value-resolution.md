@@ -62,8 +62,24 @@ MY_APP_SHOUT=false        -> enabled("shout") == false when --shout is omitted
 ```
 
 `Invocation.init` applies this same resolution to application/root flags before
-parsing the selected command. Its v1 grammar accepts root options only before
-the command.
+parsing the selected command. Mounts create another application scope. For
+`tool --home /tmp config --profile work set --mode local key value`, read each
+level separately:
+
+```zig
+const home = invocation.getValue([]const u8, "home").?;
+const config = invocation.getCommand().?;
+const profile = config.getValue([]const u8, "profile").?;
+const set = config.getCommand().?;
+const mode = set.getValue([]const u8, "mode").?;
+```
+
+`home`, `profile`, and `mode` belong to different flag scopes. A flag must
+appear before the next command token to be parsed in its scope. The host
+application's prefix controls its own root and ordinary commands. The mounted
+application's prefix controls its root and ordinary commands; a null prefix
+disables environment fallback there. Each level keeps command line,
+environment, then default precedence.
 
 ## Checked conversions
 

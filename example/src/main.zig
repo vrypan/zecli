@@ -292,7 +292,7 @@ fn run(
 
     if (try invocation.printHelpIfRequested(allocator, stdout)) return 0;
     if (invocation.present("version")) {
-        try stdout.writeAll("zecli-example 0.2.0\n");
+        try stdout.writeAll("zecli-example 0.1.0\n");
         return 0;
     }
 

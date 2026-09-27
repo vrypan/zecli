@@ -539,12 +539,24 @@ fn writeBashValueFlagCase(writer: anytype, flags: []const cli.FlagSpec, commands
     }
 }
 
+/// Writes every spelling of an option, `--name`, then `--alias`es, then `-s`,
+/// each wrapped in `quote` and separated by `separator`. Spellings follow the
+/// validated name grammar, so they need no further escaping.
+fn writeFlagSpellings(
+    writer: anytype,
+    flag: cli.FlagSpec,
+    comptime separator: []const u8,
+    comptime quote: []const u8,
+) !void {
+    try writer.print(quote ++ "--{s}" ++ quote, .{flag.name});
+    for (flag.aliases) |alias| try writer.print(separator ++ quote ++ "--{s}" ++ quote, .{alias});
+    if (flag.short) |short| try writer.print(separator ++ quote ++ "-{c}" ++ quote, .{short});
+}
+
 fn writeBashFlagPatterns(writer: anytype, flag: cli.FlagSpec, first: *bool) !void {
     if (!first.*) try writer.writeByte('|');
     first.* = false;
-    try writer.print("--{s}", .{flag.name});
-    for (flag.aliases) |alias| try writer.print("|--{s}", .{alias});
-    if (flag.short) |short| try writer.print("|-{c}", .{short});
+    try writeFlagSpellings(writer, flag, "|", "");
 }
 
 fn writeBashCommandPattern(writer: anytype, command: cli.CommandSpec) !void {
@@ -634,9 +646,7 @@ fn writeBashFlagWordList(writer: anytype, flags: []const cli.FlagSpec) !void {
 fn writeBashFlagWord(writer: anytype, flag: cli.FlagSpec, first: *bool) !void {
     if (!first.*) try writer.writeAll("\\n");
     first.* = false;
-    try writer.print("--{s}", .{flag.name});
-    for (flag.aliases) |alias| try writer.print("\\n--{s}", .{alias});
-    if (flag.short) |short| try writer.print("\\n-{c}", .{short});
+    try writeFlagSpellings(writer, flag, "\\n", "");
 }
 
 fn writeBashCommandWordList(writer: anytype, commands: []const cli.CommandSpec) !void {
@@ -1220,9 +1230,8 @@ fn writeFishAncestorWalk(writer: anytype, ancestor: *const FishAncestor) !void {
     );
     for (ancestor.app.flags) |flag| {
         if (!cli.takesValue(flag)) continue;
-        try writer.print("            case '--{s}'", .{flag.name});
-        for (flag.aliases) |alias| try writer.print(" '--{s}'", .{alias});
-        if (flag.short) |short| try writer.print(" '-{c}'", .{short});
+        try writer.writeAll("            case ");
+        try writeFlagSpellings(writer, flag, " ", "'");
         try writer.writeByte('\n');
         if (flag.value == .bool_optional) {
             try writer.writeAll("                set i (math $i + 1)\n");
@@ -1366,9 +1375,8 @@ fn writeFishValueFlagCase(
     }
     for (flags) |flag| {
         if (!cli.takesValue(flag) or flag.value == .bool_optional) continue;
-        try writer.print(" '--{s}'", .{flag.name});
-        for (flag.aliases) |alias| try writer.print(" '--{s}'", .{alias});
-        if (flag.short) |short| try writer.print(" '-{c}'", .{short});
+        try writer.writeByte(' ');
+        try writeFlagSpellings(writer, flag, " ", "'");
     }
     if (any) {
         try writer.writeAll("\n");
@@ -1379,9 +1387,8 @@ fn writeFishValueFlagCase(
         if (flag.value != .bool_optional) continue;
         try writer.writeAll(indent);
         try writer.writeAll("case");
-        try writer.print(" '--{s}'", .{flag.name});
-        for (flag.aliases) |alias| try writer.print(" '--{s}'", .{alias});
-        if (flag.short) |short| try writer.print(" '-{c}'", .{short});
+        try writer.writeByte(' ');
+        try writeFlagSpellings(writer, flag, " ", "'");
         try writer.writeByte('\n');
         try writer.writeAll(indent);
         try writer.print("    set skip {d}\n", .{optional_skip});
@@ -1460,28 +1467,16 @@ fn writeFishFlag(
     command: ?cli.CommandSpec,
 ) !void {
     const kind = cli.flagCompletion(flag);
-    const parameter_option: []const u8 = if (!cli.takesValue(flag) or flag.value == .bool_optional) "" else if (kind == .files) " -r" else " -x";
-    try writeFishCondition(writer, app, target, command, true);
-    try writer.print(" -l {s}", .{flag.name});
-    if (flag.short) |short| try writer.print(" -s {c}", .{short});
     // File values require a parameter and enable Fish's file completion.
     // Other values stay exclusive so Fish does not add ordinary filenames.
-    try writer.writeAll(parameter_option);
-    if (flag.description.len > 0) {
-        try writer.writeAll(" -d ");
-        try writeFishQuoted(writer, flag.description);
-    }
-    try writeFishValueAction(writer, app, kind, .{
-        .command = scope.name(),
-        .kind = .flag,
-        .name = flag.name,
-    });
-    try writer.writeByte('\n');
+    const parameter_option: []const u8 = if (!cli.takesValue(flag) or flag.value == .bool_optional) "" else if (kind == .files) " -r" else " -x";
 
-    // Aliases are separate completions sharing the same behavior.
-    for (flag.aliases) |alias| {
+    // The canonical name carries the short option; each alias is a separate
+    // completion with the same behavior.
+    for (0..1 + flag.aliases.len) |i| {
         try writeFishCondition(writer, app, target, command, true);
-        try writer.print(" -l {s}", .{alias});
+        try writer.print(" -l {s}", .{if (i == 0) flag.name else flag.aliases[i - 1]});
+        if (i == 0) if (flag.short) |short| try writer.print(" -s {c}", .{short});
         try writer.writeAll(parameter_option);
         if (flag.description.len > 0) {
             try writer.writeAll(" -d ");
@@ -1594,62 +1589,50 @@ fn writeFishPositionals(
 
     for (command.arguments, 0..) |argument, i| {
         if (argument.repeatable and i == command.arguments.len - 1) break;
-        if (argument.completion == .none) continue;
-        try writeFishCompleteWhen(writer, app, target);
-        try writeHelperPrefix(writer, app);
-        try writer.writeAll("_using_command ");
-        try writer.writeAll(command.name);
-        for (command.aliases) |alias| {
-            try writer.writeByte(' ');
-            try writer.writeAll(alias);
-        }
-        try writer.writeAll("; and test (");
-        try writeHelperPrefix(writer, app);
-        try writer.writeAll("_pos_");
-        try writeIdent(writer, command.name);
-        try writer.print(") -eq {d}", .{i});
-        if (command.double_dash == .passthrough) {
-            try writer.writeAll("; and not ");
-            try writeHelperPrefix(writer, app);
-            try writer.writeAll("_after_terminator");
-        }
-        try writer.writeByte('\'');
-        try writeFishValueAction(writer, app, argument.completion, .{
-            .command = command.name,
-            .kind = .argument,
-            .name = argument.name,
-        });
-        try writer.writeByte('\n');
+        try writeFishPositionalAt(writer, app, target, command, argument, "-eq", i);
     }
-
     if (trailingArgument(command)) |argument| {
-        if (argument.completion == .none) return;
-        try writeFishCompleteWhen(writer, app, target);
-        try writeHelperPrefix(writer, app);
-        try writer.writeAll("_using_command ");
-        try writer.writeAll(command.name);
-        for (command.aliases) |alias| {
-            try writer.writeByte(' ');
-            try writer.writeAll(alias);
-        }
-        try writer.writeAll("; and test (");
-        try writeHelperPrefix(writer, app);
-        try writer.writeAll("_pos_");
-        try writeIdent(writer, command.name);
-        try writer.print(") -ge {d}", .{command.arguments.len - 1});
-        if (command.double_dash == .passthrough) {
-            try writer.writeAll("; and not ");
-            try writeHelperPrefix(writer, app);
-            try writer.writeAll("_after_terminator");
-        }
-        try writer.writeByte('\'');
-        try writeFishValueAction(writer, app, argument.completion, .{
-            .command = command.name,
-            .kind = .argument,
-            .name = argument.name,
-        });
-        try writer.writeByte('\n');
+        try writeFishPositionalAt(writer, app, target, command, argument, "-ge", command.arguments.len - 1);
     }
+}
+
+/// Completes `argument` while the command's positional count compares to
+/// `index` with `comparison` (`-eq` for one slot, `-ge` for a repeatable tail).
+fn writeFishPositionalAt(
+    writer: anytype,
+    app: cli.ApplicationSpec,
+    target: FishTarget,
+    command: cli.CommandSpec,
+    argument: cli.ArgumentSpec,
+    comptime comparison: []const u8,
+    index: usize,
+) !void {
+    if (argument.completion == .none) return;
+    try writeFishCompleteWhen(writer, app, target);
+    try writeHelperPrefix(writer, app);
+    try writer.writeAll("_using_command ");
+    try writer.writeAll(command.name);
+    for (command.aliases) |alias| {
+        try writer.writeByte(' ');
+        try writer.writeAll(alias);
+    }
+    try writer.writeAll("; and test (");
+    try writeHelperPrefix(writer, app);
+    try writer.writeAll("_pos_");
+    try writeIdent(writer, command.name);
+    try writer.print(") " ++ comparison ++ " {d}", .{index});
+    if (command.double_dash == .passthrough) {
+        try writer.writeAll("; and not ");
+        try writeHelperPrefix(writer, app);
+        try writer.writeAll("_after_terminator");
+    }
+    try writer.writeByte('\'');
+    try writeFishValueAction(writer, app, argument.completion, .{
+        .command = command.name,
+        .kind = .argument,
+        .name = argument.name,
+    });
+    try writer.writeByte('\n');
 }
 
 fn writeFishPositionalCounter(

@@ -323,6 +323,11 @@ directories, and external completers declared in the specification. One script
 for the host command covers every mounted path. External completers retain the
 executable and arguments declared in their specification.
 
+Help and the generators emit their output as many small writes (about a
+thousand for a typical completion script), so give them a buffered writer and
+flush it before exiting. The example wraps `std.Io.File.writerStreaming` in a
+small adapter that keeps a `file` field for terminal-width detection.
+
 ## Release Notes
 
 Generate Markdown release notes from commit subjects:

@@ -2,25 +2,23 @@ const std = @import("std");
 const cli = @import("cli");
 const completion = @import("completion");
 
-var process_io: std.Io = undefined;
-
+/// Help and completion scripts arrive as many small writes, so they go
+/// through a buffered writer rather than one system call each. The `file`
+/// field lets zecli wrap help to that file's terminal width.
 const FileWriter = struct {
     file: std.Io.File,
+    out: *std.Io.Writer,
 
     pub fn writeAll(self: FileWriter, data: []const u8) !void {
-        try self.file.writeStreamingAll(process_io, data);
+        try self.out.writeAll(data);
     }
 
     pub fn writeByte(self: FileWriter, byte: u8) !void {
-        try self.writeAll(&.{byte});
+        try self.out.writeByte(byte);
     }
 
     pub fn print(self: FileWriter, comptime fmt: []const u8, args: anytype) !void {
-        var sfb = std.heap.stackFallback(4096, std.heap.page_allocator);
-        const allocator = sfb.get();
-        const data = try std.fmt.allocPrint(allocator, fmt, args);
-        defer allocator.free(data);
-        try self.writeAll(data);
+        try self.out.print(fmt, args);
     }
 };
 
@@ -263,20 +261,27 @@ const CommandName = cli.CommandEnum(application);
 const demo_references = [_][]const u8{ "@1/out", "@2/out", "@42/out", "note with space" };
 
 pub fn main(init: std.process.Init) !void {
-    process_io = init.io;
     // Everything parsed borrows from argv and from the specification. The
     // invocation releases its parsing buffers before `run` returns.
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
-    const stdout = cli.helpWriter(FileWriter{ .file = .stdout() }, cli.HelpStyle.auto.detect(init.io, .stdout(), init.environ_map));
-    const stderr = FileWriter{ .file = .stderr() };
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_file = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
 
-    const exit_code = run(allocator, stdout, stderr, args, init.environ_map) catch |err| {
-        if (err == error.ReportedCliError) return std.process.exit(1);
-        try stderr.print("error: {s}\n", .{@errorName(err)});
-        return std.process.exit(1);
+    const styled = cli.HelpStyle.auto.detect(init.io, .stdout(), init.environ_map);
+    const stdout = cli.helpWriter(FileWriter{ .file = .stdout(), .out = &stdout_file.interface }, styled);
+    const stderr = FileWriter{ .file = .stderr(), .out = &stderr_file.interface };
+
+    const exit_code: u8 = run(allocator, stdout, stderr, args, init.environ_map) catch |err| blk: {
+        if (err != error.ReportedCliError) try stderr.print("error: {s}\n", .{@errorName(err)});
+        break :blk 1;
     };
+    // process.exit skips deferred code, so flush explicitly first.
+    try stdout_file.interface.flush();
+    try stderr_file.interface.flush();
     if (exit_code != 0) std.process.exit(exit_code);
 }
 

@@ -28,9 +28,20 @@ requested type does not match the option's stored type.
 ## Sources and precedence
 
 Set `ApplicationSpec.prefix` to enable environment values. An option's variable
-name is the prefix, an underscore, and its canonical long name in uppercase
-with hyphens changed to underscores. For example, `.prefix = "MY_APP"` makes
-`--first-name` read `MY_APP_FIRST_NAME`.
+name is the prefix, then the canonical names of the commands leading to it,
+then its canonical long name, joined by underscores, uppercased, with hyphens
+changed to underscores. With `.prefix = "MY_APP"`:
+
+```text
+my-app --first-name           -> MY_APP_FIRST_NAME
+my-app greet --times          -> MY_APP_GREET_TIMES
+my-app config set --override  -> MY_APP_CONFIG_SET_OVERRIDE
+```
+
+Aliases never appear in variable names. Validation rejects a specification in
+which two options map to the same variable, such as a root `--greet-times`
+next to `greet --times` (`error.DuplicateEnvironmentName`). The examples below
+use root options.
 
 Explicit command-line values override environment values, which override
 defaults. When an option with a `default_value` is omitted, zecli adds that
@@ -75,11 +86,12 @@ const mode = set.getValue([]const u8, "mode").?;
 ```
 
 `home`, `profile`, and `mode` belong to different flag scopes. A flag must
-appear before the next command token to be parsed in its scope. The host
-application's prefix controls its own root and ordinary commands. The mounted
-application's prefix controls its root and ordinary commands; a null prefix
-disables environment fallback there. Each level keeps command line,
-environment, then default precedence.
+appear before the next command token to be parsed in its scope. Only the
+invoked application's prefix is used, so with `.prefix = "TOOL"` these read
+`TOOL_HOME`, `TOOL_CONFIG_PROFILE`, and `TOOL_CONFIG_SET_MODE`. A mounted
+application's own prefix applies only when it runs standalone, and a null
+prefix on the invoked application disables environment values everywhere.
+Each level keeps command line, environment, then default precedence.
 
 ## Checked conversions
 
@@ -123,7 +135,8 @@ non-repeatable environment value is never split, even if it contains commas.
 
 ## Raw result access
 
-`Command.positionals()` returns positional arguments before `--`.
+`Command.positionals()` returns positional arguments before `--`, plus those
+after it for commands with `.double_dash = .positionals`.
 `Command.passthrough()` returns an optional slice containing literal arguments
 after the separator. The separator is absent when the result is `null`; a
 trailing separator produces a non-null empty slice. Positional validation never

@@ -648,6 +648,7 @@ pub const SpecError = error{
     ConflictingMountMetadata,
     CyclicMount,
     ReservedName,
+    DuplicateEnvironmentName,
 };
 
 /// Command and long-option names use a conservative grammar that is safe in
@@ -794,7 +795,35 @@ const branches_per_comparison = 64;
 /// An upper bound on the branches `validateApplicationSpec` needs, from the
 /// number of name pairs it compares.
 fn validationBranchQuota(comptime application: ApplicationSpec) usize {
-    return walk_branch_quota + branches_per_comparison * validationPairs(application, null);
+    var pairs = validationPairs(application, null);
+    if (application.prefix != null) {
+        // Every option is compared with every other, each comparison
+        // re-walking the tree, so count the walk as well as the comparison.
+        const names = environmentNameCount(application, null);
+        pairs += 2 * names * names;
+    }
+    return walk_branch_quota + branches_per_comparison * pairs;
+}
+
+/// Options in the whole tree, mounts included. Skips cyclic mounts, which
+/// validation rejects before it walks environment names.
+fn environmentNameCount(comptime application: ApplicationSpec, comptime ancestors: ?*const MountAncestor) usize {
+    var count = application.flags.len;
+    for (application.commands) |command| {
+        if (command.mounted_application) |child| {
+            var current = ancestors;
+            const cyclic = while (current) |ancestor| : (current = ancestor.parent) {
+                if (ancestor.application == child) break true;
+            } else false;
+            if (!cyclic) {
+                const next = MountAncestor{ .application = child, .parent = ancestors };
+                count += environmentNameCount(child.*, &next);
+            }
+        } else {
+            count += command.flags.len;
+        }
+    }
+    return count;
 }
 
 fn validationPairs(comptime application: ApplicationSpec, comptime ancestors: ?*const MountAncestor) usize {
@@ -833,7 +862,104 @@ fn scopeNameCount(flags: []const FlagSpec) usize {
 
 pub fn validateApplicationSpec(application: ApplicationSpec) SpecError!void {
     const root = MountAncestor{ .application = &application, .parent = null };
-    return validateApplicationTree(&application, &root);
+    try validateApplicationTree(&application, &root);
+    if (application.prefix != null) try validateEnvironmentNames(&application);
+}
+
+// ── Environment names ────────────────────────────────────────────────────────
+//
+// Every option reads PREFIX_<COMMAND PATH>_<OPTION>. Hyphens become
+// underscores, so distinct paths can still collide ("a-b --c" and "a --b-c").
+// Names are compared back to front along a linked list of path nodes, which
+// needs no allocation and so also works at compile time.
+
+const EnvironmentPath = struct {
+    name: []const u8,
+    parent: ?*const EnvironmentPath,
+};
+
+const EnvironmentName = struct {
+    path: ?*const EnvironmentPath,
+    option: []const u8,
+    ordinal: usize,
+};
+
+fn validateEnvironmentNames(application: *const ApplicationSpec) SpecError!void {
+    var ordinal: usize = 0;
+    try forEachEnvironmentName(application, null, &ordinal, EnvironmentDuplicateCheck{ .root = application });
+}
+
+fn forEachEnvironmentName(
+    application: *const ApplicationSpec,
+    path: ?*const EnvironmentPath,
+    ordinal: *usize,
+    visitor: anytype,
+) SpecError!void {
+    for (application.flags) |flag| {
+        try visitor.visit(.{ .path = path, .option = flag.name, .ordinal = ordinal.* });
+        ordinal.* += 1;
+    }
+    for (application.commands) |command| {
+        const node = EnvironmentPath{ .name = command.name, .parent = path };
+        if (command.mounted_application) |child| {
+            try forEachEnvironmentName(child, &node, ordinal, visitor);
+            continue;
+        }
+        for (command.flags) |flag| {
+            try visitor.visit(.{ .path = &node, .option = flag.name, .ordinal = ordinal.* });
+            ordinal.* += 1;
+        }
+    }
+}
+
+const EnvironmentDuplicateCheck = struct {
+    root: *const ApplicationSpec,
+
+    fn visit(self: EnvironmentDuplicateCheck, name: EnvironmentName) SpecError!void {
+        var ordinal: usize = 0;
+        try forEachEnvironmentName(self.root, null, &ordinal, EnvironmentCompare{ .target = name });
+    }
+};
+
+const EnvironmentCompare = struct {
+    target: EnvironmentName,
+
+    fn visit(self: EnvironmentCompare, name: EnvironmentName) SpecError!void {
+        if (name.ordinal <= self.target.ordinal) return;
+        if (environmentNamesEqual(self.target, name)) return error.DuplicateEnvironmentName;
+    }
+};
+
+const EnvironmentReverse = struct {
+    path: ?*const EnvironmentPath,
+    text: []const u8,
+    remaining: usize,
+
+    fn init(name: EnvironmentName) EnvironmentReverse {
+        return .{ .path = name.path, .text = name.option, .remaining = name.option.len };
+    }
+
+    fn next(self: *EnvironmentReverse) ?u8 {
+        if (self.remaining > 0) {
+            self.remaining -= 1;
+            return environmentChar(self.text[self.remaining]);
+        }
+        const node = self.path orelse return null;
+        self.path = node.parent;
+        self.text = node.name;
+        self.remaining = node.name.len;
+        return '_';
+    }
+};
+
+fn environmentNamesEqual(a: EnvironmentName, b: EnvironmentName) bool {
+    var left = EnvironmentReverse.init(a);
+    var right = EnvironmentReverse.init(b);
+    while (true) {
+        const x = left.next() orelse return right.next() == null;
+        const y = right.next() orelse return false;
+        if (x != y) return false;
+    }
 }
 
 const MountAncestor = struct {
@@ -983,6 +1109,7 @@ fn initInvocation(
         command_spec,
         application,
         application.name,
+        application.prefix,
         args[root_scope.next_index + 1 ..],
         environ,
     );
@@ -1009,11 +1136,15 @@ fn parseSelectedCommand(
     spec: CommandSpec,
     owner: ApplicationSpec,
     parent_path: []const u8,
+    parent_env_prefix: ?[]const u8,
     args: []const [:0]const u8,
     environ: *const std.process.Environ.Map,
 ) !Command {
     const path = try std.fmt.allocPrint(allocator, "{s} {s}", .{ parent_path, spec.name });
     errdefer allocator.free(path);
+    // Parsed values borrow from the environment map, never from this name.
+    const env_prefix = if (parent_env_prefix) |prefix| try environmentPrefix(allocator, prefix, spec.name) else null;
+    defer if (env_prefix) |value| allocator.free(value);
     var diagnostic = ParseDiagnostic{};
 
     if (spec.mounted_application) |mounted| {
@@ -1023,7 +1154,7 @@ fn parseSelectedCommand(
             args,
             app.flags,
             .root,
-            .{ .prefix = app.prefix, .environ = environ },
+            .{ .prefix = env_prefix, .environ = environ },
             app,
             true,
             .passthrough,
@@ -1058,6 +1189,7 @@ fn parseSelectedCommand(
                 child_spec,
                 app,
                 path,
+                env_prefix,
                 args[scope.next_index + 1 ..],
                 environ,
             );
@@ -1085,7 +1217,7 @@ fn parseSelectedCommand(
         args,
         spec.flags,
         .complete,
-        .{ .prefix = owner.prefix, .environ = environ },
+        .{ .prefix = env_prefix, .environ = environ },
         null,
         true,
         spec.double_dash,
@@ -1223,6 +1355,20 @@ fn appendDefaults(allocator: Allocator, parsed: *Parsed, specs: []const FlagSpec
     }
 }
 
+fn environmentChar(char: u8) u8 {
+    return if (char == '-') '_' else std.ascii.toUpper(char);
+}
+
+/// The prefix for a command's options: its parent's prefix, an underscore,
+/// and the canonical command name, so `app config set` reads `APP_CONFIG_SET_*`.
+fn environmentPrefix(allocator: Allocator, parent: []const u8, command: []const u8) ![]u8 {
+    const result = try allocator.alloc(u8, parent.len + 1 + command.len);
+    @memcpy(result[0..parent.len], parent);
+    result[parent.len] = '_';
+    for (command, result[parent.len + 1 ..]) |char, *out| out.* = environmentChar(char);
+    return result;
+}
+
 fn appendEnvironment(
     allocator: Allocator,
     parsed: *Parsed,
@@ -1240,9 +1386,7 @@ fn appendEnvironment(
         defer name.deinit(name_allocator);
         try name.appendSlice(name_allocator, prefix);
         try name.append(name_allocator, '_');
-        for (spec.name) |char| {
-            try name.append(name_allocator, if (char == '-') '_' else std.ascii.toUpper(char));
-        }
+        for (spec.name) |char| try name.append(name_allocator, environmentChar(char));
 
         const raw = environ.get(name.items) orelse continue;
         if (spec.repeatable) {

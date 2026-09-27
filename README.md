@@ -153,13 +153,14 @@ to that path. Other text is preserved. `group.printHelp()` prints mounted help
 when no child was selected; `tool config --help` and
 `tool config set --help` use `invocation.printHelpIfRequested()`.
 
-Each application's `prefix` governs environment values in its own root and
-ordinary commands. A mounted application's null prefix disables environment
-fallback at that level. Root `--` ends command selection; an ordinary leaf's
-`double_dash` controls its positional or passthrough behavior. The low-level
-`cli.parseCommand` returns a single `Parsed`, so use `Invocation.init` for a
-mounted command. Runtime-built specifications must keep referenced mounted
-applications alive and call `validateApplicationSpec` before parsing.
+Environment variable names follow the command path under the invoked
+application's `prefix` (`MY_APP_CONFIG_SET_OVERRIDE`); a mounted application's
+own `prefix` applies only when it runs standalone. Root `--` ends command
+selection; an ordinary leaf's `double_dash` controls its positional or
+passthrough behavior. The low-level `cli.parseCommand` returns a single
+`Parsed`, so use `Invocation.init` for a mounted command. Runtime-built
+specifications must keep referenced mounted applications alive and call
+`validateApplicationSpec` before parsing.
 
 Arguments after `--` are preserved separately for pass-through commands:
 
@@ -201,14 +202,16 @@ const shout = command.enabled("shout");
 
 Defaults are resolved automatically when an option is omitted.
 
-When `ApplicationSpec.prefix` is set, omitted value-taking options also read a
-matching environment variable. For example, `--first-name` reads
-`MY_APP_FIRST_NAME`. Command-line values take precedence over environment
-values, which take precedence over defaults. No-value switches read boolean
-environment values, so `MY_APP_SHOUT=true` enables `--shout` when the option is
-omitted. Repeatable options read comma-separated environment values, so
-`MY_APP_TAG=fruit,asia` is equivalent to `--tag fruit --tag asia` when `--tag`
-is omitted.
+When `ApplicationSpec.prefix` is set, omitted options also read a matching
+environment variable named after the command path: a root `--first-name` reads
+`MY_APP_FIRST_NAME`, and `greet --times` reads `MY_APP_GREET_TIMES`. Validation
+rejects two options that map to the same variable
+(`error.DuplicateEnvironmentName`). Command-line values take precedence over
+environment values, which take precedence over defaults. No-value switches read
+boolean environment values, so `MY_APP_GREET_SHOUT=true` enables
+`greet --shout` when the option is omitted. Repeatable options read
+comma-separated environment values, so `MY_APP_GREET_TAG=fruit,asia` is
+equivalent to `greet --tag fruit --tag asia` when `--tag` is omitted.
 
 For raw access, checked conversions, repeatable values, and the parsed-result
 layout, see [Value Resolution](docs/value-resolution.md).

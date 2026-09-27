@@ -41,6 +41,7 @@ const mounted_app = cli.comptimeValidated(.{
 
 const host_with_mount = cli.comptimeValidated(.{
     .name = "host",
+    .prefix = "HOST",
     .description = "Host",
     .usage = "host <command>",
     .flags = &.{.{ .name = "root-only", .value = .string }},
@@ -163,10 +164,14 @@ test "mount: help and examples rebase only leading application names" {
     try testing.expect(std.mem.indexOf(u8, standalone.items(), "inner [options] <command>") != null);
 }
 
-test "mount: uses its own environment prefix and survives moving the invocation" {
+test "mount: environment names follow the command path and survive moving the invocation" {
     var environ = std.process.Environ.Map.init(testing.allocator);
     defer environ.deinit();
-    try environ.put("INNER_PROFILE", "environment");
+    try environ.put("HOST_SETTINGS_PROFILE", "path-environment");
+    try environ.put("HOST_SETTINGS_SET_VALUE", "leaf-environment");
+    // The mounted application's own prefix only applies when it runs alone.
+    try environ.put("INNER_PROFILE", "ignored");
+    try environ.put("HOST_CONFIG_PROFILE", "other-mount");
     var original = try cli.Invocation.init(
         testing.allocator,
         nw,
@@ -178,13 +183,16 @@ test "mount: uses its own environment prefix and survives moving the invocation"
     original = .{ .application = host_with_mount };
     defer moved.deinit(testing.allocator);
     const group = moved.getCommand().?;
-    try testing.expectEqualStrings("environment", group.getValue([]const u8, "profile").?);
-    try testing.expectEqualStrings("set", group.getCommand().?.name);
+    try testing.expectEqualStrings("path-environment", group.getValue([]const u8, "profile").?);
+    const leaf = group.getCommand().?;
+    try testing.expectEqualStrings("set", leaf.name);
+    try testing.expectEqualStrings("leaf-environment", leaf.getValue([]const u8, "value").?);
 }
 
-test "mount: a null prefix does not inherit the host prefix" {
+test "mount: a host without a prefix reads no environment, even in prefixed mounts" {
     const child_app = comptime cli.comptimeValidated(.{
         .name = "child",
+        .prefix = "CHILD",
         .description = "Child",
         .usage = "child <command>",
         .flags = &.{.{ .name = "profile", .value = .string, .default_value = "child-default" }},
@@ -192,16 +200,14 @@ test "mount: a null prefix does not inherit the host prefix" {
     });
     const host = comptime cli.comptimeValidated(.{
         .name = "host",
-        .prefix = "HOST",
         .description = "Host",
         .usage = "host <command>",
-        .flags = &.{.{ .name = "profile", .value = .string }},
         .commands = &.{cli.mount("child", child_app)},
     });
     var environ = std.process.Environ.Map.init(testing.allocator);
     defer environ.deinit();
-    try environ.put("HOST_PROFILE", "host-environment");
     try environ.put("CHILD_PROFILE", "child-environment");
+    try environ.put("HOST_CHILD_PROFILE", "host-environment");
     var invocation = try cli.Invocation.init(
         testing.allocator,
         nw,
@@ -210,8 +216,81 @@ test "mount: a null prefix does not inherit the host prefix" {
         &environ,
     );
     defer invocation.deinit(testing.allocator);
-    try testing.expectEqualStrings("host-environment", invocation.getValue([]const u8, "profile").?);
     try testing.expectEqualStrings("child-default", invocation.getCommand().?.getValue([]const u8, "profile").?);
+}
+
+test "validateApplicationSpec: rejects options that map to the same environment name" {
+    // Root "--greet-name" and "greet --name" both read APP_GREET_NAME.
+    try testing.expectError(error.DuplicateEnvironmentName, cli.validateApplicationSpec(.{
+        .name = "app",
+        .prefix = "APP",
+        .description = "d",
+        .usage = "u",
+        .flags = &.{.{ .name = "greet-name", .value = .string }},
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "name", .value = .string }},
+        }},
+    }));
+
+    // Hyphens become underscores, so "a-b --c" and "a --b-c" collide too.
+    const siblings = cli.ApplicationSpec{
+        .name = "app",
+        .prefix = "APP",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{
+            .{ .name = "a-b", .description = "d", .usage = "u", .flags = &.{.{ .name = "c" }} },
+            .{ .name = "a", .description = "d", .usage = "u", .flags = &.{.{ .name = "b-c" }} },
+        },
+    };
+    try testing.expectError(error.DuplicateEnvironmentName, cli.validateApplicationSpec(siblings));
+
+    // Without a prefix no variables are read, so nothing can collide.
+    var unprefixed = siblings;
+    unprefixed.prefix = null;
+    try cli.validateApplicationSpec(unprefixed);
+
+    // The same option name under different commands is fine.
+    try cli.validateApplicationSpec(.{
+        .name = "app",
+        .prefix = "APP",
+        .description = "d",
+        .usage = "u",
+        .flags = &.{.{ .name = "name", .value = .string }},
+        .commands = &.{.{
+            .name = "greet",
+            .description = "d",
+            .usage = "u",
+            .flags = &.{.{ .name = "name", .value = .string }},
+        }},
+    });
+}
+
+test "validateApplicationSpec: detects environment collisions through mounts" {
+    const child_app = cli.ApplicationSpec{
+        .name = "child",
+        .description = "d",
+        .usage = "u",
+        .commands = &.{.{ .name = "set", .description = "d", .usage = "u", .flags = &.{.{ .name = "key" }} }},
+    };
+    const children = [_]cli.CommandSpec{.{
+        .name = "config",
+        .description = "d",
+        .usage = "u",
+        .mounted_application = &child_app,
+    }};
+    // Root "--config-set-key" and "config set --key" both read APP_CONFIG_SET_KEY.
+    try testing.expectError(error.DuplicateEnvironmentName, cli.validateApplicationSpec(.{
+        .name = "app",
+        .prefix = "APP",
+        .description = "d",
+        .usage = "u",
+        .flags = &.{.{ .name = "config-set-key" }},
+        .commands = &children,
+    }));
 }
 
 fn mountedAllocationProbe(allocator: std.mem.Allocator) !void {
@@ -953,7 +1032,7 @@ test "Invocation: resolves root and command values through the public API" {
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
     try environ.put("MY_APP_NAME", "Ada");
-    try environ.put("MY_APP_TIMES", "3");
+    try environ.put("MY_APP_GREET_TIMES", "3");
 
     const application = comptime cli.comptimeValidated(.{
         .name = "demo",
@@ -989,7 +1068,7 @@ test "Invocation: command line values override environment values" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_NAME", "Jane");
+    try environ.put("MY_APP_GREET_NAME", "Jane");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1019,7 +1098,7 @@ test "Invocation: ignores environment values without an application prefix" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_NAME", "Jane");
+    try environ.put("MY_APP_GREET_NAME", "Jane");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1045,7 +1124,7 @@ test "Invocation: reports an invalid environment value" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_TIMES", "many");
+    try environ.put("MY_APP_GREET_TIMES", "many");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1073,9 +1152,9 @@ test "Invocation: resolves no-value switches from boolean environment values" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_VERBOSE", "true");
-    try environ.put("MY_APP_QUIET", "false");
-    try environ.put("MY_APP_ENABLED", "yes");
+    try environ.put("MY_APP_GREET_VERBOSE", "true");
+    try environ.put("MY_APP_GREET_QUIET", "false");
+    try environ.put("MY_APP_GREET_ENABLED", "yes");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1112,7 +1191,7 @@ test "Invocation: command-line switch overrides false environment value" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_VERBOSE", "false");
+    try environ.put("MY_APP_GREET_VERBOSE", "false");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1142,7 +1221,7 @@ test "Invocation: reports invalid boolean environment values for no-value switch
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_VERBOSE", "maybe");
+    try environ.put("MY_APP_GREET_VERBOSE", "maybe");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1170,8 +1249,8 @@ test "Invocation: resolves repeatable environment values by comma" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_TAG", "fruit, asia,europe");
-    try environ.put("MY_APP_COUNT", "1, 2,3");
+    try environ.put("MY_APP_GREET_TAG", "fruit, asia,europe");
+    try environ.put("MY_APP_GREET_COUNT", "1, 2,3");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1212,7 +1291,7 @@ test "Invocation: command-line repeatable values override environment values" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_TAG", "fruit,asia");
+    try environ.put("MY_APP_GREET_TAG", "fruit,asia");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1243,7 +1322,7 @@ test "Invocation: non-repeatable environment values are not comma split" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_NAME", "Ada,Grace");
+    try environ.put("MY_APP_GREET_NAME", "Ada,Grace");
 
     const application = cli.ApplicationSpec{
         .name = "demo",
@@ -1270,7 +1349,7 @@ test "Invocation: rejects empty repeatable environment values" {
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
-    try environ.put("MY_APP_TAG", "fruit,,asia");
+    try environ.put("MY_APP_GREET_TAG", "fruit,,asia");
 
     const application = cli.ApplicationSpec{
         .name = "demo",

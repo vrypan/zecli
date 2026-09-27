@@ -3,7 +3,7 @@
 Versions are listed newest first; changes within a version are listed in the
 order they were made.
 
-## 0.5.0 — 2026-09-18
+## 0.5.0 — 2026-09-28
 
 - Add mounted applications: `cli.mount` nests a whole application under a
   command, with its own option scope. Help, diagnostics, and completion for

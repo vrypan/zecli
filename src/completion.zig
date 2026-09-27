@@ -259,7 +259,7 @@ fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !v
     try writer.writeAll("\n\n");
 
     try writeBashHelpers(writer, app);
-    try forEachSlot(writer, app, writeBashExternal);
+    try forEachSlot(writer, app, writePosixExternal);
 
     // Main entry point: locate the command, then dispatch.
     try writePrefix(writer, app);
@@ -461,7 +461,9 @@ fn writeBashHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
     );
 }
 
-fn writeBashExternal(
+/// Defines the bash or zsh function for one external completer slot; both
+/// shells call the script's `_external` helper with POSIX-quoted words.
+fn writePosixExternal(
     writer: anytype,
     app: cli.ApplicationSpec,
     slot: Slot,
@@ -792,7 +794,7 @@ fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !vo
         \\
         \\
     );
-    try forEachSlot(writer, app, writeZshExternal);
+    try forEachSlot(writer, app, writePosixExternal);
 
     for (app.commands) |command| try writeZshCommandFn(writer, app, command);
 
@@ -880,28 +882,6 @@ fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !vo
             try writer.writeAll("\n}\n\n");
         }
     }
-}
-
-fn writeZshExternal(
-    writer: anytype,
-    app: cli.ApplicationSpec,
-    slot: Slot,
-    kind: cli.CompletionKind,
-) anyerror!void {
-    const external = switch (kind) {
-        .external => |value| value,
-        else => return,
-    };
-    try writeExternalName(writer, app, slot);
-    try writer.writeAll("() {\n    ");
-    try writeHelperPrefix(writer, app);
-    try writer.writeAll("_external ");
-    try writeQuoted(writer, external.executable);
-    for (external.arguments) |argument| {
-        try writer.writeByte(' ');
-        try writeQuoted(writer, argument);
-    }
-    try writer.writeAll("\n}\n\n");
 }
 
 fn writeZshCommandEntry(writer: anytype, name: []const u8, description: []const u8) !void {

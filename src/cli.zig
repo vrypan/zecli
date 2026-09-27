@@ -607,11 +607,6 @@ fn findLongIndex(specs: []const FlagSpec, name: []const u8) ?usize {
     return null;
 }
 
-fn findShort(specs: []const FlagSpec, short: u8) ?FlagSpec {
-    const index = findShortIndex(specs, short) orelse return null;
-    return specs[index];
-}
-
 fn findShortIndex(specs: []const FlagSpec, short: u8) ?usize {
     for (specs, 0..) |spec, i| {
         if (spec.short == short) return i;
@@ -1758,17 +1753,9 @@ fn printParseErrorContext(
             "error: option '--{s}' requires <{s}>\n",
             .{ flag_name, diagnostic.expected orelse "VALUE" },
         ),
-        .invalid_int => try writer.print(
+        .invalid_int, .invalid_float, .invalid_bool => try writer.print(
             "error: invalid value for '--{s}': expected {s}, got '{s}'\n",
-            .{ flag_name, diagnostic.expected orelse "N", diagnostic.value orelse "" },
-        ),
-        .invalid_float => try writer.print(
-            "error: invalid value for '--{s}': expected {s}, got '{s}'\n",
-            .{ flag_name, diagnostic.expected orelse "NUMBER", diagnostic.value orelse "" },
-        ),
-        .invalid_bool => try writer.print(
-            "error: invalid value for '--{s}': expected {s}, got '{s}'\n",
-            .{ flag_name, diagnostic.expected orelse "BOOL", diagnostic.value orelse "" },
+            .{ flag_name, diagnostic.expected orelse "VALUE", diagnostic.value orelse "" },
         ),
         .invalid_choice => {
             try writer.print(

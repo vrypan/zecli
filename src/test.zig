@@ -2738,3 +2738,71 @@ test "help defaults to the width cap and zero uses the full available width" {
         }
     }
 }
+
+// ── Output buffering ─────────────────────────────────────────────────────────
+
+/// Records every call the library makes, like an unbuffered file would.
+const CallCounter = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    calls: usize = 0,
+
+    fn deinit(self: *CallCounter) void {
+        self.bytes.deinit(testing.allocator);
+    }
+    pub fn writeAll(self: *CallCounter, data: []const u8) !void {
+        self.calls += 1;
+        try self.bytes.appendSlice(testing.allocator, data);
+    }
+    pub fn writeByte(self: *CallCounter, byte: u8) !void {
+        try self.writeAll(&.{byte});
+    }
+    pub fn print(self: *CallCounter, comptime fmt: []const u8, args: anytype) !void {
+        self.calls += 1;
+        try self.bytes.print(testing.allocator, fmt, args);
+    }
+};
+
+test "help reaches the caller's writer in one write" {
+    var counter = CallCounter{};
+    defer counter.deinit();
+    try cli.printApplicationHelp(testing.allocator, &counter, demo_app);
+
+    var direct = Buffer.init(testing.allocator);
+    defer direct.deinit();
+    try cli.printApplicationHelp(testing.allocator, &direct, demo_app);
+
+    try testing.expectEqual(@as(usize, 1), counter.calls);
+    try testing.expectEqualStrings(direct.items(), counter.bytes.items);
+}
+
+test "parse errors reach the caller's writer in one write" {
+    var counter = CallCounter{};
+    defer counter.deinit();
+    try testing.expectError(error.ReportedCliError, cli.Invocation.init(
+        testing.allocator,
+        &counter,
+        demo_app,
+        &.{"missing"},
+        &empty_environ,
+    ));
+    try testing.expectEqual(@as(usize, 1), counter.calls);
+    try testing.expect(std.mem.indexOf(u8, counter.bytes.items, "unknown command 'missing'") != null);
+}
+
+test "bufferedWriter passes large writes and prints through unchanged" {
+    var counter = CallCounter{};
+    defer counter.deinit();
+    var out = cli.bufferedWriter(&counter);
+
+    const large = "x" ** 5000;
+    try out.writeAll("head ");
+    try out.writeAll(large);
+    try out.print("{s}|{d}", .{ large, 42 });
+    try out.writeByte('!');
+    try out.flush();
+
+    try testing.expectEqualStrings("head " ++ large ++ large ++ "|42!", counter.bytes.items);
+    // "head " is flushed before the oversized write, which passes straight
+    // through, as does the oversized print; "!" arrives with the final flush.
+    try testing.expectEqual(@as(usize, 4), counter.calls);
+}

@@ -2,9 +2,9 @@ const std = @import("std");
 const cli = @import("cli");
 const completion = @import("completion");
 
-/// Help and completion scripts arrive as many small writes, so they go
-/// through a buffered writer rather than one system call each. The `file`
-/// field lets zecli wrap help to that file's terminal width.
+/// Adapts a buffered std.Io.File writer to the writer interface zecli
+/// expects. zecli buffers its own output; this buffer is for the program's.
+/// The `file` field lets zecli wrap help to that file's terminal width.
 const FileWriter = struct {
     file: std.Io.File,
     out: *std.Io.Writer,

@@ -240,7 +240,9 @@ fn forEachSlot(
 // ── Bash ─────────────────────────────────────────────────────────────────────
 
 pub fn generateBash(writer: anytype, app: cli.ApplicationSpec) !void {
-    try writeBashScript(writer, app, true);
+    var out = cli.bufferedWriter(writer);
+    try writeBashScript(&out, app, true);
+    try out.flush();
 }
 
 /// Room for a mounted application's derived name, which grows by about ten
@@ -768,7 +770,9 @@ fn writeBashPositionals(
 // ── Zsh ──────────────────────────────────────────────────────────────────────
 
 pub fn generateZsh(writer: anytype, app: cli.ApplicationSpec) !void {
-    try writeZshScript(writer, app, true);
+    var out = cli.bufferedWriter(writer);
+    try writeZshScript(&out, app, true);
+    try out.flush();
 }
 
 fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !void {
@@ -1079,8 +1083,10 @@ fn writeZshValueWord(writer: anytype, value: []const u8) !void {
 // ── Fish ─────────────────────────────────────────────────────────────────────
 
 pub fn generateFish(writer: anytype, app: cli.ApplicationSpec) !void {
-    try writeFishScript(writer, app, .{ .host = app.name, .mounted = false });
-    try writeFishMounts(writer, app, app.name, null);
+    var out = cli.bufferedWriter(writer);
+    try writeFishScript(&out, app, .{ .host = app.name, .mounted = false });
+    try writeFishMounts(&out, app, app.name, null);
+    try out.flush();
 }
 
 /// Where completions are registered. A mounted application's completions

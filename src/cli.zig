@@ -211,48 +211,113 @@ pub fn terminalWidth(file: std.Io.File) usize {
     return if (size.col > 0) size.col else default_help_line_width;
 }
 
+/// The writer's own type, looking through one pointer.
+fn WriterBase(comptime W: type) type {
+    return switch (@typeInfo(W)) {
+        .pointer => |pointer| pointer.child,
+        else => W,
+    };
+}
+
+fn writerDeclares(comptime W: type, comptime name: []const u8) bool {
+    const T = WriterBase(W);
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, name),
+        else => false,
+    };
+}
+
 // A custom writer may supply `helpWidth() usize`. Otherwise use its `file`
 // field when that is a std.Io.File, or assume stdout for opaque writers.
 fn writerTerminalWidth(writer: anytype) usize {
-    const T = switch (@typeInfo(@TypeOf(writer))) {
-        .pointer => |pointer| pointer.child,
-        else => @TypeOf(writer),
-    };
-    switch (@typeInfo(T)) {
-        .@"struct", .@"union", .@"enum", .@"opaque" => {
-            if (@hasDecl(T, "helpWidth")) {
-                const width = writer.helpWidth();
-                return if (width > 0) width else default_help_line_width;
-            }
-        },
-        else => {},
+    if (comptime writerDeclares(@TypeOf(writer), "helpWidth")) {
+        const width = writer.helpWidth();
+        return if (width > 0) width else default_help_line_width;
     }
-    switch (@typeInfo(T)) {
-        .@"struct" => {
-            if (@hasField(T, "file")) {
-                if (@TypeOf(writer.file) == std.Io.File) return terminalWidth(writer.file);
-            }
-        },
-        else => {},
+    const T = WriterBase(@TypeOf(writer));
+    if (@typeInfo(T) == .@"struct" and @hasField(T, "file")) {
+        if (@TypeOf(writer.file) == std.Io.File) return terminalWidth(writer.file);
     }
     return terminalWidth(.stdout());
+}
+
+/// The application's wrapping cap; zero means the full available width.
+fn writerMaxWidth(writer: anytype) usize {
+    if (comptime writerDeclares(@TypeOf(writer), "helpMaxWidth")) return writer.helpMaxWidth();
+    return default_help_line_width;
 }
 
 // Keep available terminal width separate from the application's wrapping cap.
 fn writerHelpWidth(writer: anytype) usize {
     const width = writerTerminalWidth(writer);
-    const T = switch (@typeInfo(@TypeOf(writer))) {
-        .pointer => |pointer| pointer.child,
-        else => @TypeOf(writer),
-    };
-    var limit: usize = default_help_line_width;
-    switch (@typeInfo(T)) {
-        .@"struct", .@"union", .@"enum", .@"opaque" => {
-            if (@hasDecl(T, "helpMaxWidth")) limit = writer.helpMaxWidth();
-        },
-        else => {},
-    }
+    const limit = writerMaxWidth(writer);
     return if (limit == 0) width else @min(width, limit);
+}
+
+/// Bytes zecli collects before passing output on to the caller's writer.
+const output_buffer_size = 4096;
+
+/// Collects zecli's many small writes and passes them to `writer` in large
+/// chunks, so output costs a few writes rather than one per word even when the
+/// caller's writer is unbuffered. It forwards the optional help hooks, so
+/// styling and width detection behave as if `writer` were used directly.
+/// Call `flush` when done.
+pub fn bufferedWriter(writer: anytype) BufferedWriter(@TypeOf(writer)) {
+    return .{ .inner = writer };
+}
+
+pub fn BufferedWriter(comptime W: type) type {
+    return struct {
+        inner: W,
+        buffer: [output_buffer_size]u8 = undefined,
+        len: usize = 0,
+
+        const Self = @This();
+
+        pub fn writeAll(self: *Self, data: []const u8) !void {
+            if (data.len > self.buffer.len - self.len) {
+                try self.flush();
+                if (data.len > self.buffer.len) return self.inner.writeAll(data);
+            }
+            @memcpy(self.buffer[self.len..][0..data.len], data);
+            self.len += data.len;
+        }
+
+        pub fn writeByte(self: *Self, byte: u8) !void {
+            try self.writeAll(&.{byte});
+        }
+
+        pub fn print(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+            if (std.fmt.bufPrint(self.buffer[self.len..], fmt, args)) |written| {
+                self.len += written.len;
+                return;
+            } else |_| {}
+            try self.flush();
+            if (std.fmt.bufPrint(&self.buffer, fmt, args)) |written| {
+                self.len = written.len;
+                return;
+            } else |_| {}
+            try self.inner.print(fmt, args);
+        }
+
+        pub fn flush(self: *Self) !void {
+            if (self.len == 0) return;
+            try self.inner.writeAll(self.buffer[0..self.len]);
+            self.len = 0;
+        }
+
+        pub fn helpStyle(self: *const Self) bool {
+            return helpStyled(self.inner);
+        }
+
+        pub fn helpWidth(self: *const Self) usize {
+            return writerTerminalWidth(self.inner);
+        }
+
+        pub fn helpMaxWidth(self: *const Self) usize {
+            return writerMaxWidth(self.inner);
+        }
+    };
 }
 
 /// Stack space for the `[choices: ...]` and `[default: ...]` suffixes, past
@@ -395,6 +460,12 @@ pub const Command = struct {
     }
 
     pub fn printHelp(self: *const Command, allocator: Allocator, writer: anytype) !void {
+        var out = bufferedWriter(writer);
+        try self.printHelpTo(allocator, &out);
+        try out.flush();
+    }
+
+    fn printHelpTo(self: *const Command, allocator: Allocator, writer: anytype) !void {
         if (self.spec.mounted_application) |application| {
             try printApplicationHelpAt(allocator, writer, application.*, self.path.?);
         } else {
@@ -453,7 +524,14 @@ pub const Invocation = struct {
         args: []const [:0]const u8,
         environ: *const std.process.Environ.Map,
     ) !Invocation {
-        return initInvocation(allocator, writer, application, args, environ);
+        // Only failures write, so a successful parse leaves nothing to flush.
+        var out = bufferedWriter(writer);
+        var result = initInvocation(allocator, &out, application, args, environ);
+        out.flush() catch |err| {
+            if (result) |*invocation| invocation.deinit(allocator) else |_| {}
+            return err;
+        };
+        return result;
     }
 
     pub fn deinit(self: *Invocation, allocator: Allocator) void {
@@ -485,17 +563,19 @@ pub const Invocation = struct {
     }
 
     pub fn printHelpIfRequested(self: *const Invocation, allocator: Allocator, writer: anytype) !bool {
+        var out = bufferedWriter(writer);
         switch (self.help_target) {
             .none => return false,
-            .application => try printApplicationHelp(allocator, writer, self.application),
+            .application => try printApplicationHelpContext(allocator, &out, self.application, null),
             .command => {
                 var command = self.getCommand().?;
                 while (!command.help_requested) {
                     command = command.getCommand().?;
                 }
-                try command.printHelp(allocator, writer);
+                try command.printHelpTo(allocator, &out);
             },
         }
+        try out.flush();
         return true;
     }
 };
@@ -1094,7 +1174,7 @@ fn initInvocation(
     const token = args[root_scope.next_index];
     const command_spec = findCommand(application, token) orelse {
         try writer.print("error: unknown command '{s}'\n\n", .{token});
-        try printApplicationHelp(allocator, writer, application);
+        try printApplicationHelpContext(allocator, writer, application, null);
         return error.ReportedCliError;
     };
 
@@ -1718,7 +1798,9 @@ pub fn parseBool(value: []const u8) !bool {
 }
 
 fn printParseError(writer: anytype, spec: CommandSpec, diagnostic: ParseDiagnostic) !void {
-    return printParseErrorContext(writer, spec, diagnostic, null, commandLabel(spec));
+    var out = bufferedWriter(writer);
+    try printParseErrorContext(&out, spec, diagnostic, null, commandLabel(spec));
+    try out.flush();
 }
 
 fn printParseErrorAt(
@@ -1815,16 +1897,7 @@ fn commandLabel(spec: CommandSpec) []const u8 {
 // ── Help ─────────────────────────────────────────────────────────────────────
 
 fn helpStyled(writer: anytype) bool {
-    const T = switch (@typeInfo(@TypeOf(writer))) {
-        .pointer => |p| p.child,
-        else => @TypeOf(writer),
-    };
-    switch (@typeInfo(T)) {
-        .@"struct", .@"union", .@"enum", .@"opaque" => {
-            if (@hasDecl(T, "helpStyle")) return writer.helpStyle();
-        },
-        else => {},
-    }
+    if (comptime writerDeclares(@TypeOf(writer), "helpStyle")) return writer.helpStyle();
     return false;
 }
 
@@ -1927,7 +2000,9 @@ fn printHelpExtras(writer: anytype, width: usize, spec: anytype, rebase: ?HelpRe
 }
 
 pub fn printApplicationHelp(allocator: Allocator, writer: anytype, application: ApplicationSpec) !void {
-    return printApplicationHelpContext(allocator, writer, application, null);
+    var out = bufferedWriter(writer);
+    try printApplicationHelpContext(allocator, &out, application, null);
+    try out.flush();
 }
 
 fn printApplicationHelpAt(allocator: Allocator, writer: anytype, application: ApplicationSpec, path: []const u8) !void {
@@ -1949,10 +2024,13 @@ fn printApplicationHelpContext(allocator: Allocator, writer: anytype, applicatio
 /// standalone help, since the host path is unknown here; `Command.printHelp`
 /// on a parsed invocation shows the full path instead.
 pub fn printCommandHelp(allocator: Allocator, writer: anytype, spec: CommandSpec) !void {
+    var out = bufferedWriter(writer);
     if (spec.mounted_application) |application| {
-        return printApplicationHelp(allocator, writer, application.*);
+        try printApplicationHelpContext(allocator, &out, application.*, null);
+    } else {
+        try printCommandHelpContext(allocator, &out, spec, null);
     }
-    return printCommandHelpContext(allocator, writer, spec, null);
+    try out.flush();
 }
 
 fn printCommandHelpAt(allocator: Allocator, writer: anytype, spec: CommandSpec, source_name: []const u8, parent_path: []const u8) !void {
@@ -2000,7 +2078,9 @@ fn writeCommandLabel(writer: anytype, spec: CommandSpec) !void {
 }
 
 pub fn printCommandList(writer: anytype, commands: []const CommandSpec) !void {
-    return printCommandListWidth(writer, writerHelpWidth(writer), commands);
+    var out = bufferedWriter(writer);
+    try printCommandListWidth(&out, writerHelpWidth(writer), commands);
+    try out.flush();
 }
 
 fn printCommandListWidth(writer: anytype, width: usize, commands: []const CommandSpec) !void {
@@ -2025,7 +2105,9 @@ fn printCommandListWidth(writer: anytype, width: usize, commands: []const Comman
 }
 
 pub fn printArguments(writer: anytype, arguments: []const ArgumentSpec) !void {
-    return printArgumentsWidth(writer, writerHelpWidth(writer), arguments);
+    var out = bufferedWriter(writer);
+    try printArgumentsWidth(&out, writerHelpWidth(writer), arguments);
+    try out.flush();
 }
 
 fn printArgumentsWidth(writer: anytype, width: usize, arguments: []const ArgumentSpec) !void {
@@ -2054,7 +2136,9 @@ pub fn printOptions(
     flags: []const FlagSpec,
     include_help: bool,
 ) !void {
-    return printOptionsWidth(allocator, writer, writerHelpWidth(writer), flags, include_help);
+    var out = bufferedWriter(writer);
+    try printOptionsWidth(allocator, &out, writerHelpWidth(writer), flags, include_help);
+    try out.flush();
 }
 
 fn printOptionsWidth(

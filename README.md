@@ -323,10 +323,11 @@ directories, and external completers declared in the specification. One script
 for the host command covers every mounted path. External completers retain the
 executable and arguments declared in their specification.
 
-Help and the generators emit their output as many small writes (about a
-thousand for a typical completion script), so give them a buffered writer and
-flush it before exiting. The example wraps `std.Io.File.writerStreaming` in a
-small adapter that keeps a `file` field for terminal-width detection.
+Help, parse errors, and the generators buffer their own output in a 4 KB stack
+buffer, so any writer, even an unbuffered one, receives a few large writes: a
+typical completion script arrives in two to four. `cli.bufferedWriter` exposes
+the same buffer for your own output; it forwards the help hooks described
+above, and you call `flush` when done.
 
 ## Release Notes
 

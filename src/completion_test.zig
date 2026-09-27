@@ -702,3 +702,32 @@ test "fish: stops completing REF after -- for a passthrough command, not a posit
     try expectContains(text, "_using_command wrap' -F");
     try expectMissing(text, "_using_command wrap; and not __demo_after_terminator' -F");
 }
+
+test "generators reach the caller's writer in a few large writes" {
+    const Counter = struct {
+        calls: usize = 0,
+        bytes: usize = 0,
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            self.calls += 1;
+            self.bytes += data.len;
+        }
+        pub fn writeByte(self: *@This(), _: u8) !void {
+            self.calls += 1;
+            self.bytes += 1;
+        }
+        pub fn print(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
+            self.calls += 1;
+            self.bytes += std.fmt.count(fmt, args);
+        }
+    };
+    for ([_]Shell{ .bash, .zsh, .fish }) |shell| {
+        var counter = Counter{};
+        switch (shell) {
+            .bash => try completion.generateBash(&counter, app),
+            .zsh => try completion.generateZsh(&counter, app),
+            .fish => try completion.generateFish(&counter, app),
+        }
+        try testing.expect(counter.bytes > 0);
+        try testing.expect(counter.calls <= counter.bytes / 4096 + 1);
+    }
+}

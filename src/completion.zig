@@ -243,8 +243,14 @@ pub fn generateBash(writer: anytype, app: cli.ApplicationSpec) !void {
     try writeBashScript(writer, app, true);
 }
 
-fn mountedName(parent: []const u8, index: usize) ![]u8 {
-    return std.fmt.allocPrint(std.heap.page_allocator, "{s}-mount-{d}", .{ parent, index });
+/// Room for a mounted application's derived name, which grows by about ten
+/// bytes per level of mounting.
+const mounted_name_size = 256;
+
+/// Names a mounted application `<parent>-mount-<index>`, which is unique in
+/// the tree and keeps its helper functions apart from the host's.
+fn mountedName(buffer: *[mounted_name_size]u8, parent: []const u8, index: usize) error{MountedNameTooLong}![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}-mount-{d}", .{ parent, index }) catch error.MountedNameTooLong;
 }
 
 fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !void {
@@ -360,8 +366,8 @@ fn writeBashScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !v
     }
     for (app.commands, 0..) |command, index| {
         if (command.mounted_application) |mounted| {
-            const name = try mountedName(app.name, index);
-            defer std.heap.page_allocator.free(name);
+            var name_buffer: [mounted_name_size]u8 = undefined;
+            const name = try mountedName(&name_buffer, app.name, index);
             var child = mounted.*;
             child.name = name;
             try writeBashScript(writer, child, false);
@@ -861,8 +867,8 @@ fn writeZshScript(writer: anytype, app: cli.ApplicationSpec, register: bool) !vo
     }
     for (app.commands, 0..) |command, index| {
         if (command.mounted_application) |mounted| {
-            const name = try mountedName(app.name, index);
-            defer std.heap.page_allocator.free(name);
+            var name_buffer: [mounted_name_size]u8 = undefined;
+            const name = try mountedName(&name_buffer, app.name, index);
             var child = mounted.*;
             child.name = name;
             try writeZshScript(writer, child, false);
@@ -1093,52 +1099,95 @@ fn writeZshValueWord(writer: anytype, value: []const u8) !void {
 // ── Fish ─────────────────────────────────────────────────────────────────────
 
 pub fn generateFish(writer: anytype, app: cli.ApplicationSpec) !void {
-    try writeFishScript(writer, app);
+    try writeFishScript(writer, app, .{ .host = app.name, .mounted = false });
+    try writeFishMounts(writer, app, app.name, null);
+}
+
+/// Where completions are registered. A mounted application's completions
+/// attach to the host program and apply only while its `_scope` holds, and its
+/// helpers read the command line through `_tokens`, which presents the words
+/// after the mount point as if they were a standalone invocation.
+const FishTarget = struct {
+    host: []const u8,
+    mounted: bool,
+};
+
+fn writeFishMounts(
+    writer: anytype,
+    app: cli.ApplicationSpec,
+    host: []const u8,
+    parent: ?*const FishAncestor,
+) !void {
     for (app.commands, 0..) |command, index| {
-        if (command.mounted_application) |mounted| {
-            const name = try mountedName(app.name, index);
-            defer std.heap.page_allocator.free(name);
-            var child = mounted.*;
-            child.name = name;
-            const ancestor = FishAncestor{ .app = app, .command = command };
-            try writeFishMounted(writer, child, app.name, &ancestor);
-        }
+        const mounted = command.mounted_application orelse continue;
+        var name_buffer: [mounted_name_size]u8 = undefined;
+        var child = mounted.*;
+        child.name = try mountedName(&name_buffer, app.name, index);
+        const ancestor = FishAncestor{ .app = app, .command = command, .parent = parent };
+        try writeFishMountedTokens(writer, child.name, &ancestor);
+        try writeFishScript(writer, child, .{ .host = host, .mounted = true });
+        try writeFishMounts(writer, child, host, &ancestor);
     }
 }
 
-fn writeFishScript(writer: anytype, app: cli.ApplicationSpec) !void {
+fn writeFishScript(writer: anytype, app: cli.ApplicationSpec, target: FishTarget) !void {
     try writer.writeAll("# fish completion for ");
     try writer.writeAll(app.name);
     try writer.writeAll("\n\n");
-    try writer.writeAll("complete -c ");
-    try writeFishQuoted(writer, app.name);
-    try writer.writeAll(" -f\n\n");
+    if (!target.mounted) {
+        try writer.writeAll("complete -c ");
+        try writeFishQuoted(writer, app.name);
+        try writer.writeAll(" -f\n\n");
+    }
 
-    try writeFishCommandFn(writer, app);
-    try writeFishHelpers(writer, app);
+    try writeFishCommandFn(writer, app, target);
+    try writeFishHelpers(writer, app, target);
     try forEachSlot(writer, app, writeFishHelper);
 
     // Root: commands and root options.
     for (app.commands) |command| {
-        try writeFishCommandEntry(writer, app, command.name, command.description);
+        try writeFishCommandEntry(writer, app, target, command.name, command.description);
         for (command.aliases) |alias| {
-            try writeFishCommandEntry(writer, app, alias, command.description);
+            try writeFishCommandEntry(writer, app, target, alias, command.description);
         }
     }
     try writer.writeByte('\n');
 
-    for (app.flags) |flag| try writeFishFlag(writer, app, rootScope(app), flag, null);
-    try writeFishFlag(writer, app, rootScope(app), cli.help_flag, null);
+    for (app.flags) |flag| try writeFishFlag(writer, app, target, rootScope(app), flag, null);
+    try writeFishFlag(writer, app, target, rootScope(app), cli.help_flag, null);
     try writer.writeByte('\n');
 
     for (app.commands) |command| {
         try writer.writeAll("# ");
         try writer.writeAll(command.name);
         try writer.writeByte('\n');
-        for (command.flags) |flag| try writeFishFlag(writer, app, commandScope(command), flag, command);
-        try writeFishFlag(writer, app, commandScope(command), cli.help_flag, command);
-        try writeFishPositionals(writer, app, command);
+        for (command.flags) |flag| try writeFishFlag(writer, app, target, commandScope(command), flag, command);
+        try writeFishFlag(writer, app, target, commandScope(command), cli.help_flag, command);
+        try writeFishPositionals(writer, app, target, command);
         try writer.writeByte('\n');
+    }
+}
+
+/// Starts a `complete` registration up to and including the opening quote of
+/// its condition; the caller writes the condition and closes the quote.
+fn writeFishCompleteWhen(writer: anytype, app: cli.ApplicationSpec, target: FishTarget) !void {
+    try writer.writeAll("complete -c ");
+    try writeFishQuoted(writer, target.host);
+    try writer.writeAll(" -n '");
+    if (target.mounted) {
+        try writeHelperPrefix(writer, app);
+        try writer.writeAll("_scope; and ");
+    }
+}
+
+/// The words typed before the cursor, program name first.
+fn writeFishTokens(writer: anytype, app: cli.ApplicationSpec, target: FishTarget) !void {
+    if (target.mounted) {
+        try writer.writeByte('(');
+        try writeHelperPrefix(writer, app);
+        try writer.writeAll("_tokens)");
+    } else {
+        try writer.writeAll("(commandline -opc)");
     }
 }
 
@@ -1147,76 +1196,6 @@ const FishAncestor = struct {
     command: cli.CommandSpec,
     parent: ?*const FishAncestor = null,
 };
-
-const FishBuffer = struct {
-    bytes: std.ArrayList(u8) = .empty,
-    allocator: std.mem.Allocator,
-
-    fn deinit(self: *FishBuffer) void {
-        self.bytes.deinit(self.allocator);
-    }
-    pub fn writeAll(self: *FishBuffer, value: []const u8) !void {
-        try self.bytes.appendSlice(self.allocator, value);
-    }
-    pub fn writeByte(self: *FishBuffer, value: u8) !void {
-        try self.bytes.append(self.allocator, value);
-    }
-    pub fn print(self: *FishBuffer, comptime fmt: []const u8, args: anytype) !void {
-        const value = try std.fmt.allocPrint(self.allocator, fmt, args);
-        defer self.allocator.free(value);
-        try self.writeAll(value);
-    }
-};
-
-fn writeFishMounted(writer: anytype, app: cli.ApplicationSpec, host: []const u8, ancestors: *const FishAncestor) !void {
-    try writeFishMountedTokens(writer, app.name, ancestors);
-    var buffer = FishBuffer{ .allocator = std.heap.page_allocator };
-    defer buffer.deinit();
-    try writeFishScript(&buffer, app);
-
-    const registration = try std.fmt.allocPrint(std.heap.page_allocator, "complete -c '{s}'", .{app.name});
-    defer std.heap.page_allocator.free(registration);
-    var lines = std.mem.splitScalar(u8, buffer.bytes.items, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, registration)) {
-            const rest = line[registration.len..];
-            if (std.mem.eql(u8, rest, " -f")) continue;
-            try writer.writeAll("complete -c ");
-            try writeFishQuoted(writer, host);
-            if (std.mem.indexOf(u8, rest, " -n '")) |condition| {
-                try writer.writeAll(rest[0 .. condition + " -n '".len]);
-                try writeHelperPrefix(writer, app);
-                try writer.writeAll("_scope; and ");
-                try writer.writeAll(rest[condition + " -n '".len ..]);
-            } else {
-                try writer.writeAll(" -n '");
-                try writeHelperPrefix(writer, app);
-                try writer.writeAll("_scope'");
-                try writer.writeAll(rest);
-            }
-        } else if (std.mem.indexOf(u8, line, "(commandline -opc)")) |at| {
-            try writer.writeAll(line[0..at]);
-            try writer.writeAll("(");
-            try writeHelperPrefix(writer, app);
-            try writer.writeAll("_tokens)");
-            try writer.writeAll(line[at + "(commandline -opc)".len ..]);
-        } else {
-            try writer.writeAll(line);
-        }
-        try writer.writeByte('\n');
-    }
-
-    for (app.commands, 0..) |command, index| {
-        if (command.mounted_application) |mounted| {
-            const name = try mountedName(app.name, index);
-            defer std.heap.page_allocator.free(name);
-            var child = mounted.*;
-            child.name = name;
-            const ancestor = FishAncestor{ .app = app, .command = command, .parent = ancestors };
-            try writeFishMounted(writer, child, host, &ancestor);
-        }
-    }
-}
 
 fn writeFishMountedTokens(writer: anytype, name: []const u8, ancestors: *const FishAncestor) !void {
     const app = cli.ApplicationSpec{ .name = name, .description = "", .usage = "" };
@@ -1307,12 +1286,13 @@ fn writeFishAncestorWalk(writer: anytype, ancestor: *const FishAncestor) !void {
 
 /// Emits the function that reports which command the current command line
 /// names, skipping root options and the values they consume.
-fn writeFishCommandFn(writer: anytype, app: cli.ApplicationSpec) !void {
+fn writeFishCommandFn(writer: anytype, app: cli.ApplicationSpec, target: FishTarget) !void {
     try writer.writeAll("function ");
     try writeHelperPrefix(writer, app);
+    try writer.writeAll("_command\n    set -l tokens ");
+    try writeFishTokens(writer, app, target);
     try writer.writeAll(
-        \\_command
-        \\    set -l tokens (commandline -opc)
+        \\
         \\    set -e tokens[1]
         \\    set -l skip 0
         \\    for token in $tokens
@@ -1345,7 +1325,7 @@ fn writeFishCommandFn(writer: anytype, app: cli.ApplicationSpec) !void {
     );
 }
 
-fn writeFishHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
+fn writeFishHelpers(writer: anytype, app: cli.ApplicationSpec, target: FishTarget) !void {
     try writer.writeAll("function ");
     try writeHelperPrefix(writer, app);
     try writer.writeAll("_no_command\n    not ");
@@ -1368,9 +1348,10 @@ fn writeFishHelpers(writer: anytype, app: cli.ApplicationSpec) !void {
     // Everything after `--` is positional, so option completions stop there.
     try writer.writeAll("function ");
     try writeHelperPrefix(writer, app);
+    try writer.writeAll("_after_terminator\n    for token in ");
+    try writeFishTokens(writer, app, target);
     try writer.writeAll(
-        \\_after_terminator
-        \\    for token in (commandline -opc)
+        \\
         \\        if test "$token" = '--'
         \\            return 0
         \\        end
@@ -1440,12 +1421,11 @@ fn writeFishOptionalSkip(writer: anytype, commands: []const cli.CommandSpec) !vo
 fn writeFishCommandEntry(
     writer: anytype,
     app: cli.ApplicationSpec,
+    target: FishTarget,
     name: []const u8,
     description: []const u8,
 ) !void {
-    try writer.writeAll("complete -c ");
-    try writeFishQuoted(writer, app.name);
-    try writer.writeAll(" -n '");
+    try writeFishCompleteWhen(writer, app, target);
     try writeHelperPrefix(writer, app);
     try writer.writeAll("_no_command' -a ");
     try writeFishQuoted(writer, name);
@@ -1454,13 +1434,15 @@ fn writeFishCommandEntry(
     try writer.writeByte('\n');
 }
 
+/// Writes `complete -c HOST -n '...'` selecting the root scope or a command.
 fn writeFishCondition(
     writer: anytype,
     app: cli.ApplicationSpec,
+    target: FishTarget,
     command: ?cli.CommandSpec,
     exclude_after_terminator: bool,
 ) !void {
-    try writer.writeAll(" -n '");
+    try writeFishCompleteWhen(writer, app, target);
     if (command) |spec| {
         // Command names use the validated grammar, so they carry no characters
         // that would need escaping inside this condition string.
@@ -1486,15 +1468,14 @@ fn writeFishCondition(
 fn writeFishFlag(
     writer: anytype,
     app: cli.ApplicationSpec,
+    target: FishTarget,
     scope: Scope,
     flag: cli.FlagSpec,
     command: ?cli.CommandSpec,
 ) !void {
     const kind = cli.flagCompletion(flag);
     const parameter_option: []const u8 = if (!cli.takesValue(flag) or flag.value == .bool_optional) "" else if (kind == .files) " -r" else " -x";
-    try writer.writeAll("complete -c ");
-    try writeFishQuoted(writer, app.name);
-    try writeFishCondition(writer, app, command, true);
+    try writeFishCondition(writer, app, target, command, true);
     try writer.print(" -l {s}", .{flag.name});
     if (flag.short) |short| try writer.print(" -s {c}", .{short});
     // File values require a parameter and enable Fish's file completion.
@@ -1513,9 +1494,7 @@ fn writeFishFlag(
 
     // Aliases are separate completions sharing the same behavior.
     for (flag.aliases) |alias| {
-        try writer.writeAll("complete -c ");
-        try writeFishQuoted(writer, app.name);
-        try writeFishCondition(writer, app, command, true);
+        try writeFishCondition(writer, app, target, command, true);
         try writer.print(" -l {s}", .{alias});
         try writer.writeAll(parameter_option);
         if (flag.description.len > 0) {
@@ -1605,6 +1584,7 @@ fn writeFishHelper(
 fn writeFishPositionals(
     writer: anytype,
     app: cli.ApplicationSpec,
+    target: FishTarget,
     command: cli.CommandSpec,
 ) !void {
     if (command.arguments.len == 0) return;
@@ -1614,9 +1594,7 @@ fn writeFishPositionals(
     if (uniformArguments(command)) {
         const kind = command.arguments[0].completion;
         if (kind == .none) return;
-        try writer.writeAll("complete -c ");
-        try writeFishQuoted(writer, app.name);
-        try writeFishCondition(writer, app, command, command.double_dash == .passthrough);
+        try writeFishCondition(writer, app, target, command, command.double_dash == .passthrough);
         try writeFishValueAction(writer, app, kind, .{
             .command = command.name,
             .kind = .argument,
@@ -1626,14 +1604,12 @@ fn writeFishPositionals(
         return;
     }
 
-    try writeFishPositionalCounter(writer, app, command);
+    try writeFishPositionalCounter(writer, app, target, command);
 
     for (command.arguments, 0..) |argument, i| {
         if (argument.repeatable and i == command.arguments.len - 1) break;
         if (argument.completion == .none) continue;
-        try writer.writeAll("complete -c ");
-        try writeFishQuoted(writer, app.name);
-        try writer.writeAll(" -n '");
+        try writeFishCompleteWhen(writer, app, target);
         try writeHelperPrefix(writer, app);
         try writer.writeAll("_using_command ");
         try writer.writeAll(command.name);
@@ -1662,9 +1638,7 @@ fn writeFishPositionals(
 
     if (trailingArgument(command)) |argument| {
         if (argument.completion == .none) return;
-        try writer.writeAll("complete -c ");
-        try writeFishQuoted(writer, app.name);
-        try writer.writeAll(" -n '");
+        try writeFishCompleteWhen(writer, app, target);
         try writeHelperPrefix(writer, app);
         try writer.writeAll("_using_command ");
         try writer.writeAll(command.name);
@@ -1695,15 +1669,17 @@ fn writeFishPositionals(
 fn writeFishPositionalCounter(
     writer: anytype,
     app: cli.ApplicationSpec,
+    target: FishTarget,
     command: cli.CommandSpec,
 ) !void {
     try writer.writeAll("function ");
     try writeHelperPrefix(writer, app);
     try writer.writeAll("_pos_");
     try writeIdent(writer, command.name);
+    try writer.writeAll("\n    set -l tokens ");
+    try writeFishTokens(writer, app, target);
     try writer.writeAll(
         \\
-        \\    set -l tokens (commandline -opc)
         \\    set -e tokens[1]
         \\    set -l count 0
         \\    set -l found 0

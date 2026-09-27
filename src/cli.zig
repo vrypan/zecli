@@ -2060,15 +2060,32 @@ fn descriptionStart(writer: anytype, width: usize, label_end: usize, requested: 
     return requested;
 }
 
-/// Width of "name" or "name, alias, alias", computed without building it, so
-/// that the column measuring pass costs no allocation.
-fn commandLabelLen(spec: CommandSpec) usize {
-    var len = spec.name.len;
-    for (spec.aliases) |alias| len += ", ".len + alias.len;
-    return len;
+/// Counts bytes instead of writing them, so a label's width comes from the
+/// same code that renders it, without allocating.
+const CountingWriter = struct {
+    count: usize = 0,
+
+    pub fn writeAll(self: *CountingWriter, data: []const u8) error{}!void {
+        self.count += data.len;
+    }
+
+    pub fn writeByte(self: *CountingWriter, _: u8) error{}!void {
+        self.count += 1;
+    }
+
+    pub fn print(self: *CountingWriter, comptime fmt: []const u8, args: anytype) error{}!void {
+        self.count += std.fmt.count(fmt, args);
+    }
+};
+
+/// The number of bytes `writeLabel(writer, value)` writes.
+fn labelWidth(comptime writeLabel: anytype, value: anytype) usize {
+    var counter = CountingWriter{};
+    writeLabel(&counter, value) catch |err| switch (err) {};
+    return counter.count;
 }
 
-/// Writes what `commandLabelLen` measures.
+/// Writes "name" or "name, alias, alias".
 fn writeCommandLabel(writer: anytype, spec: CommandSpec) !void {
     try writer.writeAll(spec.name);
     for (spec.aliases) |alias| {
@@ -2090,7 +2107,7 @@ fn printCommandListWidth(writer: anytype, width: usize, commands: []const Comman
 
     var max_label_len: usize = 0;
     for (commands) |command| {
-        max_label_len = @max(max_label_len, commandLabelLen(command));
+        max_label_len = @max(max_label_len, labelWidth(writeCommandLabel, command));
     }
 
     for (commands) |command| {
@@ -2098,7 +2115,7 @@ fn printCommandListWidth(writer: anytype, width: usize, commands: []const Comman
         try style(writer, .label);
         try writeCommandLabel(writer, command);
         try style(writer, .reset);
-        const description_col = try descriptionStart(writer, width, commandLabelLen(command) + 4, max_label_len + 6);
+        const description_col = try descriptionStart(writer, width, labelWidth(writeCommandLabel, command) + 4, max_label_len + 6);
         _ = try printWrapped(writer, width, command.description, description_col, description_col);
         try writer.writeByte('\n');
     }
@@ -2115,16 +2132,17 @@ fn printArgumentsWidth(writer: anytype, width: usize, arguments: []const Argumen
 
     try heading(writer, "ARGUMENTS");
 
+    // Argument labels include their indent, so measured widths do too.
     var max_label_len: usize = 0;
     for (arguments) |argument| {
-        max_label_len = @max(max_label_len, argumentLabelLen(argument));
+        max_label_len = @max(max_label_len, labelWidth(writeArgumentLabel, argument));
     }
 
     for (arguments) |argument| {
         try style(writer, .label);
         try writeArgumentLabel(writer, argument);
         try style(writer, .reset);
-        const description_col = try descriptionStart(writer, width, argumentLabelLen(argument) + 4, max_label_len + 6);
+        const description_col = try descriptionStart(writer, width, labelWidth(writeArgumentLabel, argument), max_label_len + 2);
         _ = try printWrapped(writer, width, argument.description, description_col, description_col);
         try writer.writeByte('\n');
     }
@@ -2154,10 +2172,10 @@ fn printOptionsWidth(
 
     var max_label_len: usize = 0;
     for (flags) |flag| {
-        max_label_len = @max(max_label_len, flagLabelLen(flag));
+        max_label_len = @max(max_label_len, labelWidth(writeFlagLabel, flag));
     }
     if (include_help) {
-        max_label_len = @max(max_label_len, flagLabelLen(help_flag));
+        max_label_len = @max(max_label_len, labelWidth(writeFlagLabel, help_flag));
     }
 
     for (flags) |flag| {
@@ -2179,7 +2197,7 @@ fn printOption(
     try style(writer, .label);
     try writeFlagLabel(writer, flag);
     try style(writer, .reset);
-    const description_col = try descriptionStart(writer, width, flagLabelLen(flag), max_label_len + 2);
+    const description_col = try descriptionStart(writer, width, labelWidth(writeFlagLabel, flag), max_label_len + 2);
 
     var line_len = try printWrapped(writer, width, flag.description, description_col, description_col);
 
@@ -2275,25 +2293,8 @@ fn printWrapped(writer: anytype, width: usize, text: []const u8, requested_inden
     return line_len;
 }
 
-/// Renders "    -n, --name, --nom <TEXT>" for the option list.
-/// Width of an option label, computed without building it, so that the column
-/// measuring pass costs no allocation.
-fn flagLabelLen(spec: FlagSpec) usize {
-    // "    -s, " or eight spaces that stand in for a missing short option.
-    var len: usize = 8;
-    len += "--".len + spec.name.len;
-    for (spec.aliases) |alias| len += ", --".len + alias.len;
-    len += switch (spec.value) {
-        .none => 0,
-        // " <NAME>"
-        .string, .int, .signed_int, .float, .bool_required => 3 + getValueName(spec).len,
-        // "[=NAME]"
-        .bool_optional => 3 + getValueName(spec).len,
-    };
-    return len;
-}
-
-/// Writes what `flagLabelLen` measures.
+/// Writes "    -n, --name, --nom <TEXT>" for the option list; eight spaces
+/// stand in for a missing short option.
 fn writeFlagLabel(writer: anytype, spec: FlagSpec) !void {
     if (spec.short) |short| {
         try writer.writeAll("    -");
@@ -2336,12 +2337,6 @@ pub fn getValueName(spec: FlagSpec) []const u8 {
         .float => "NUMBER",
         .bool_required, .bool_optional => "BOOL",
     };
-}
-
-fn argumentLabelLen(argument: ArgumentSpec) usize {
-    const brackets: usize = 2;
-    const repeat: usize = if (argument.repeatable) 3 else 0;
-    return argument.name.len + brackets + repeat;
 }
 
 fn writeArgumentLabel(writer: anytype, argument: ArgumentSpec) !void {

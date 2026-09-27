@@ -329,25 +329,19 @@ typical completion script arrives in two to four. `cli.bufferedWriter` exposes
 the same buffer for your own output; it forwards the help hooks described
 above, and you call `flush` when done.
 
-## Release Notes
+## Releases
 
-Generate Markdown release notes from commit subjects:
+Changes are recorded in [CHANGELOG.md](CHANGELOG.md). To release, set the
+version in `build.zig.zon`, give the version's changelog section a date, then
+tag and push:
 
 ```sh
-scripts/release-notes
-scripts/release-notes v0.3.1
-scripts/release-notes --range v0.3.0..v0.3.1
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 The `Release` GitHub Actions workflow runs on pushed `v*` tags and creates a
-GitHub Release whose notes come from the same script:
-
-```sh
-git tag v0.3.1
-git push origin v0.3.1
-```
-
-You can also run the workflow manually with an existing tag. The workflow uses
-the previous reachable tag as the start of the release range. Release creation
-fails if `build.zig.zon` does not contain the same version as the tag, without
-the leading `v`.
+GitHub Release whose notes link to the changelog. It fails if `build.zig.zon`
+does not contain the tag's version, without the leading `v`, or if
+`CHANGELOG.md` has no section for that version or still marks it
+`Unreleased`. You can also run the workflow manually with an existing tag.

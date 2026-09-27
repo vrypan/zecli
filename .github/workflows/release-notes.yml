@@ -21,7 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Check package version matches tag
@@ -39,23 +38,31 @@ jobs:
             exit 1
           fi
 
-      - name: Generate notes
+      - name: Check the changelog covers the tag
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          scripts/release-notes "$RELEASE_TAG" > release-notes.md
-          cat release-notes.md
 
-      - name: Add notes to job summary
+          version="${RELEASE_TAG#v}"
+          heading="$(grep -m1 "^## ${version//./\\.} " CHANGELOG.md || true)"
+          if [ -z "$heading" ]; then
+            echo "CHANGELOG.md has no section for $RELEASE_TAG"
+            exit 1
+          fi
+          if [[ "$heading" == *Unreleased* ]]; then
+            echo "CHANGELOG.md still marks $RELEASE_TAG as unreleased: $heading"
+            exit 1
+          fi
+
+      - name: Write notes
         shell: bash
+        env:
+          CHANGELOG_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ inputs.tag || github.ref_name }}/CHANGELOG.md
         run: |
-          {
-            echo "## Release Notes"
-            echo
-            cat release-notes.md
-          } >> "$GITHUB_STEP_SUMMARY"
+          printf 'See [CHANGELOG.md](%s) for the changes in this release.\n' "$CHANGELOG_URL" > release-notes.md
+          cat release-notes.md
 
       - name: Create release
         env:

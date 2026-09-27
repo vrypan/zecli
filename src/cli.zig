@@ -105,11 +105,14 @@ fn HelpWriter(comptime W: type) type {
         styled: bool,
         /// Maximum help width; zero wraps at the full available width.
         max_width: usize = default_help_line_width,
+        /// Fixed available width; zero detects it from the wrapped writer.
+        width: usize = 0,
         const Self = @This();
         pub fn helpStyle(self: Self) bool {
             return self.styled;
         }
         pub fn helpWidth(self: Self) usize {
+            if (self.width > 0) return self.width;
             return writerTerminalWidth(self.inner);
         }
         pub fn helpMaxWidth(self: Self) usize {
@@ -644,6 +647,7 @@ pub const SpecError = error{
     InvalidDefaultValue,
     ConflictingMountMetadata,
     CyclicMount,
+    ReservedName,
 };
 
 /// Command and long-option names use a conservative grammar that is safe in
@@ -668,6 +672,12 @@ fn validateFlags(flags: []const FlagSpec) SpecError!void {
         for (flag.aliases) |alias| {
             if (!isValidName(alias)) return error.InvalidName;
             if (std.mem.eql(u8, alias, flag.name)) return error.AliasEqualsName;
+        }
+
+        // The parser intercepts -h and --help before looking at the scope's
+        // own options, so a flag spelled that way could never be reached.
+        if (namesOverlap(flag, help_flag) or flag.short == help_flag.short) {
+            return error.ReservedName;
         }
 
         if (!takesValue(flag)) {

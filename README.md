@@ -57,6 +57,9 @@ const application = cli.comptimeValidated(.{
 });
 ```
 
+Every scope gets `-h, --help` automatically, so an option may not use the name
+`help`, the alias `help`, or the short name `h` (`error.ReservedName`).
+
 The full example is in [`example/src/main.zig`](example/src/main.zig).
 
 ## Parsing
@@ -256,8 +259,15 @@ other writers assume stdout for width only. A custom writer can define
 `pub fn helpWidth(self: ...) usize` to supply the available width (zero selects
 the fallback),
 or call `cli.terminalWidth(file)` to query a different output file. The
-`helpWriter` adapter preserves this behavior. In-memory writers can return a
-fixed width and use `cli.helpWriter(&buffer, true)` for styled snapshots.
+`helpWriter` adapter preserves this behavior unless its `width` is set. For
+snapshots of in-memory output, pin the width so the result does not depend on
+the terminal running the program:
+
+```zig
+var help_output = cli.helpWriter(&buffer, true);
+help_output.width = 80;
+try cli.printApplicationHelp(allocator, help_output, application);
+```
 
 To use the full terminal width while keeping word wrapping, set the adapter's
 `max_width` to zero. A positive value sets a different cap:

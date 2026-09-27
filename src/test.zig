@@ -1972,6 +1972,53 @@ test "validateCommandSpec: rejects duplicate short options" {
     try testing.expectError(error.DuplicateShortOption, cli.validateCommandSpec(spec));
 }
 
+test "validateCommandSpec: reserves -h and --help for help" {
+    const spellings = [_]cli.FlagSpec{
+        .{ .name = "host", .short = 'h', .value = .string },
+        .{ .name = "help" },
+        .{ .name = "assist", .aliases = &.{"help"} },
+    };
+    for (spellings) |flag| {
+        const spec = cli.CommandSpec{ .name = "c", .description = "d", .usage = "u", .flags = &.{flag} };
+        try testing.expectError(error.ReservedName, cli.validateCommandSpec(spec));
+    }
+
+    // Uppercase H and names merely containing "help" stay available.
+    const allowed = cli.CommandSpec{
+        .name = "c",
+        .description = "d",
+        .usage = "u",
+        .flags = &.{ .{ .name = "host", .short = 'H' }, .{ .name = "helper" } },
+    };
+    try cli.validateCommandSpec(allowed);
+}
+
+test "validateApplicationSpec: reserves -h for help among root options" {
+    const application = cli.ApplicationSpec{
+        .name = "app",
+        .description = "d",
+        .usage = "u",
+        .flags = &.{.{ .name = "host", .short = 'h', .value = .string }},
+    };
+    try testing.expectError(error.ReservedName, cli.validateApplicationSpec(application));
+}
+
+test "helpWriter: a pinned width ignores the terminal" {
+    var buffer = Buffer.init(testing.allocator);
+    defer buffer.deinit();
+
+    var output = cli.helpWriter(&buffer, false);
+    output.width = 30;
+    try cli.printCommandHelp(testing.allocator, output, .{
+        .name = "x",
+        .description = "one two three four five six seven eight nine ten eleven twelve",
+        .usage = "x",
+    });
+
+    var lines = std.mem.splitScalar(u8, buffer.items(), '\n');
+    while (lines.next()) |line| try testing.expect(line.len <= 30);
+}
+
 test "validateCommandSpec: rejects an option alias equal to its own name" {
     const spec = cli.CommandSpec{
         .name = "c",

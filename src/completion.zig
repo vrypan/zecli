@@ -917,7 +917,9 @@ fn writeZshCommandFn(
     // zecli offers nothing once it has been typed; positional-mode commands
     // keep matching the argument specs below across the boundary.
     if (command.double_dash == .passthrough) {
-        try writer.writeAll("    if (( ${words[(I)--]} )); then\n        return 1\n    fi\n");
+        // (i) yields the first "--", or one past the end when there is none,
+        // so only a delimiter before the word being completed stops us.
+        try writer.writeAll("    if (( ${words[(i)--]} < CURRENT )); then\n        return 1\n    fi\n");
     }
     try writer.writeAll("    _arguments -S \\\n");
     for (command.flags) |flag| {

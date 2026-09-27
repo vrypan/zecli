@@ -687,8 +687,8 @@ test "zsh: stops completing after -- for a passthrough command, not a positional
     const cat_body = text[cat_fn..wrap_fn];
     const wrap_body = text[wrap_fn..run_fn];
 
-    try expectContains(cat_body, "${words[(I)--]}");
-    try expectMissing(wrap_body, "${words[(I)--]}");
+    try expectContains(cat_body, "${words[(i)--]} < CURRENT");
+    try expectMissing(wrap_body, "${words[(i)--]}");
 }
 
 test "fish: stops completing REF after -- for a passthrough command, not a positional one" {

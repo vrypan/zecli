@@ -76,6 +76,8 @@ check "choices"                   always            zecli-example greet --color 
 check "choices via alias"         always            zecli-example greet --colour ""
 check "choices after ="           always            zecli-example greet --color = ""
 refute "no options after --"      --color           zecli-example greet -- -
+check "passthrough positional"    bash              zecli-example completion ""
+refute "passthrough stops at --"  bash              zecli-example completion -- ""
 check "external candidate"        "note with space" zecli-example cat --ref ""
 check "external prefix"           "@42/out"         zecli-example cat --ref @4
 check "mounted command"           get               zecli-example config ""
@@ -147,6 +149,8 @@ check "long option alias" --colour 'zecli-example greet -'
 check "choices" always 'zecli-example greet --color '
 check "choices via alias" always 'zecli-example greet --colour '
 refute "no options after --" --color 'zecli-example greet -- -'
+check "passthrough positional" bash 'zecli-example completion '
+refute "passthrough stops at --" bash 'zecli-example completion -- '
 check "external candidate" "note with space" 'zecli-example cat --ref '
 check "external prefix" "@42/out" 'zecli-example cat --ref @4'
 check "root file flag" zecli002-file 'zecli-example --config zecli002'
@@ -215,7 +219,8 @@ send() {
     zpty -r -m zt out "*${tag}*ZMARK *"
 }
 
-send "autoload -Uz compinit && compinit -u -d $work/dump" || exit 1
+# Emacs keys regardless of $EDITOR, so cursor movement in tests is predictable.
+send "bindkey -e; autoload -Uz compinit && compinit -u -d $work/dump" || exit 1
 send "source ${(q)script}" || exit 1
 send "compadd() { local -a __m; builtin compadd -O __m \"\$@\"; print -lr -- \"\${__m[@]}\" >> ${(q)cap}; builtin compadd \"\$@\" }" || exit 1
 
@@ -262,6 +267,10 @@ check "long option alias" --colour 'zecli-example greet -'
 check "choices" always 'zecli-example greet --color '
 check "choices via alias" always 'zecli-example greet --colour '
 refute "no options after --" --color 'zecli-example greet -- -'
+check "passthrough positional" bash 'zecli-example completion '
+refute "passthrough stops at --" bash 'zecli-example completion -- '
+# Cursor moved back before an existing "--": still completes normally.
+check "passthrough before later --" bash $'zecli-example completion  --\C-b\C-b\C-b'
 check "external candidate" 'note with space' 'zecli-example cat --ref '
 check "external prefix" '@42/out' 'zecli-example cat --ref @4'
 check "mounted command" get 'zecli-example config '
